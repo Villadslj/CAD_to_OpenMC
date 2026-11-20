@@ -32,6 +32,7 @@ from CAD_to_OpenMC.datadirectory import mesher_datadir
 from CAD_to_OpenMC.check_step import has_degenerate_toroids
 from CAD_to_OpenMC.h5m_io import write_h5m
 from CAD_to_OpenMC.meshed_model import MeshedModel
+from CAD_to_OpenMC.merge import connect_solids, find_overlaps as _find_overlaps
 from CAD_to_OpenMC.occ_mesher import mesh_and_check
 from CAD_to_OpenMC.options import BACKEND_DEFAULTS, MeshOptions
 from CAD_to_OpenMC.step_reader import StepFile
@@ -605,6 +606,8 @@ class Assembly:
         # the surface mesh and the outcome of its checks, set by the stl2 and db backends
         self.meshed_model = None
         self.validation_report = None
+        # the regions that more than one solid laid claim to, set by merge_all
+        self.overlaps = []
 
     def dummy_h5m(self):
         """Check that MOAB can write a hdf-file; this is what the backends that go through pymoab rely on."""
@@ -1040,7 +1043,7 @@ class Assembly:
             options,
             names=[getattr(e, "name", None) or "" for e in self.entities],
             implicit_complement=self.implicit_complement,
-            cad_volumes=[e.solid.Volume() for e in self.entities],
+            cad_volumes=[e.volume for e in self.entities],
             volume_rtol=mesher_config.get("volume_tolerance"),
         )
         meshed = time.perf_counter()
@@ -1388,71 +1391,79 @@ class Assembly:
         tags["global_id"] = moab_core.tag_get_handle(types.GLOBAL_ID_TAG_NAME)
         return moab_core, tags
 
+    def _solid_label(self, i):
+        """Number and part name of the i'th entity, for messages."""
+        name = getattr(self.entities[i], "name", "")
+        return f"{i + 1}" + (f" ('{name}')" if name else "")
+
+    def _print_overlaps(self, overlaps, prefix, resolved, limit=20):
+        largest = sorted(overlaps, key=lambda overlap: -overlap.volume)
+        for overlap in largest[:limit]:
+            labels = [self._solid_label(i) for i in overlap.solids]
+            print(
+                f"{prefix}: solids {', '.join(labels[:-1])} and {labels[-1]} overlap "
+                f"in a region of volume {overlap.volume:.6g}."
+                + (f" The region is given to solid {overlap.owner + 1}." if resolved else "")
+            )
+        if len(largest) > limit:
+            print(
+                f"{prefix}: ... and {len(largest) - limit} smaller overlaps, "
+                f"{sum(o.volume for o in largest):.6g} in volume all together."
+            )
+
+    def find_overlaps(self):
+        """Look for solids that overlap.
+
+        merge_all notices an overlap only if faces of the solids involved coincide. This method
+        computes all intersections between the solids, which takes about twice as long as
+        merge_all. It changes nothing.
+
+        returns
+        -------
+        list of CAD_to_OpenMC.merge.Overlap
+            The largest first. Each has the positions of the solids in the list of entities, and
+            the volume of the region they have in common. Contacts that are not exact in the CAD
+            model show up as overlaps of a very small volume.
+        """
+        overlaps = _find_overlaps([e.solid for e in self.entities])
+        if self.verbose:
+            self._print_overlaps(overlaps, "INFO", resolved=False)
+            print(f"INFO: found {len(overlaps)} overlaps between {len(self.entities)} solids.")
+        return overlaps
+
     def merge_all(self):
+        """Make the solids that touch share their common faces.
+
+        Every entity keeps its place in the list and gets the solid that has taken the place of
+        its own. Solids that overlap are told apart where the merge brings the overlap to light,
+        see find_overlaps: the region they have in common is given to the smallest of them, and
+        such overlaps are reported and kept in the attribute overlaps. A solid that is cut into
+        parts that do not touch by solids that overlap it becomes one entity for every part.
+        """
         # merging a single object does not really make sense
         if len(self.entities) > 0:
-            # extract cq solids backend algorithm
-            unmerged = [e.solid for e in self.entities]
+            connected = connect_solids([e.solid for e in self.entities])
+            self.overlaps = connected.overlaps
+            for line in connected.warnings[:20]:
+                print(f"WARNING: OpenCASCADE reports for the merge: {line}")
+            self._print_overlaps(connected.overlaps, "WARNING", resolved=True)
 
-            # Pre-calculate and cache the volume, bounding box, and center of each
-            unmerged_vols = [x.Volume() for x in unmerged]
-            unmerged_bbs = [x.BoundingBox() for x in unmerged]
-            unmerged_centers = [x.Center() for x in unmerged]
-
-            # do merge
-            # merged = self._merge_solids(unmerged, fuzzy_value=1e-6)
-            merged = self._merge_solids_full(unmerged, fuzzy_value=1e-6)
-            # the merging process may result in extra volumes.
-            # We need to make sure these are at the end of the list
-            # If not this results in a loss of volumes in the end.
-            print("INFO: reordering volumes after merge")
-            tmp_ents = []
-
-            # Figure of which of the merged solids best corresponds to
-            # each of the unmerged volumes.
-            merged_solids = merged.Solids()
-
-            # Pre-calculate and cache the volume, bounding box, and center of each
-            merged_vols = [x.Volume() for x in merged_solids]
-            merged_bbs = [x.BoundingBox() for x in merged_solids]
-            merged_centers = [x.Center() for x in merged_solids]
-
-            for j, orig in enumerate(unmerged):
-                d_small = 1e9
-                i_small = -1
-                if self.verbose > 1:
+            merged = []
+            for i, (ent, pieces) in enumerate(zip(self.entities, connected.pieces)):
+                if not pieces:
                     print(
-                        f"INFO: {len(merged_solids)} merged solids left in list of originally {len(merged.Solids())}"
+                        f"WARNING: solid {self._solid_label(i)} has no region of its own and is left out. "
+                        "Please examine the CAD model."
                     )
-                for i, ms in enumerate(merged_solids):
-                    d = similar_solids(
-                        unmerged_vols[j],
-                        unmerged_bbs[j],
-                        unmerged_centers[j],
-                        merged_vols[i],
-                        merged_bbs[i],
-                        merged_centers[i],
-                    )
-                    if d < d_small:
-                        i_small, d_small = i, d
-                if i_small == -1:
-                    print(
-                        f"WARNING: Could not find a matching merged volume for volume {j+1}.",
-                        end=" ",
-                    )
-                    print(
-                        "This volume/entity will be skipped. Please examine the output volume carefully."
-                    )
-                else:
-                    # Transfer the picked solid to the list of merged solids, removing (pop) it from the list
-                    # This to avoid going through the whole list more than once.
-                    ent = self.entities[j]
-                    ent.solid = merged_solids.pop(i_small)
-                    merged_vols.pop(i_small)
-                    merged_bbs.pop(i_small)
-                    merged_centers.pop(i_small)
-                    tmp_ents.append(ent)
-            self.entities = tmp_ents
+                for n, piece in enumerate(pieces):
+                    if n > 0:
+                        # cut into parts that do not touch: every part is a volume of the same material
+                        bounds = ent.material_bounds_in_assembly
+                        ent = Entity(solid=ent.solid, idx=ent.idx, tag=ent.tag, name=getattr(ent, "name", ""))
+                        ent.material_bounds_in_assembly = bounds
+                    ent.solid = cq.Shape.cast(piece)
+                    merged.append(ent)
+            self.entities = merged
 
     def imprint_all(self):
         if len(self.entities) > 0:
