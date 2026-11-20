@@ -42,7 +42,7 @@ networkx
 unidecode
 Cython
 ```
-Note, it is possible to run CAD_to_OpenMC without gmsh installed. In this case the material-tag extraction feature is disabled, and you will have to supply a list of tags to be applied sequentially.
+Note, it is possible to run CAD_to_OpenMC without gmsh installed: it is only needed for the gmsh meshing backend. The material tags are read from the step-file itself.
 Also note, if you follow the conda-route below, caquery-ocp is called ocp.
 
 ## To install/set up in a virtual python environment
@@ -237,6 +237,11 @@ As of 0.3.6 it is possible to manipulate the delimiter used when extracting mate
 import CAD_to_OpenMC.assembly as ab
 a=ab.Assembly()
 a.set_tag_delim("\s@")
+```
+
+The names of the parts are read from the step-file together with the shapes. All solids of a part get the name of that part. Up to version 1.0 the names were found by importing the file a second time with gmsh, which took most of the import time for files with many parts, and did not find a name for the solids of a part that consists of several bodies. That way of finding the names is still available:
+```python
+a.names_from='gmsh'
 ```
 
 ## implicit complement
