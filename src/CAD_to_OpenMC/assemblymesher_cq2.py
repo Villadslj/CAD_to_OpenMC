@@ -183,4 +183,7 @@ class MesherCQSTL2Builder:
                 tolerance, angular_tolerance, min_mesh_size, max_mesh_size
             )
             self._instance._clear_face_hashtable()
+            # the instance is shared by all runs, so nothing may be left from the previous one
+            self._instance.refine = refine
+            self._instance.threads = min(threads, len(entities))
         return self._instance

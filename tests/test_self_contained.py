@@ -1,8 +1,10 @@
 import CAD_to_OpenMC.assembly as ab
 import subprocess as sp
 import sys
+import h5py
 import numpy as np
 import pathlib as pl
+import pytest
 
 instep = """
 ISO-10303-21;
@@ -223,31 +225,40 @@ ds0=np.array([
 [24,21,23],
 ])
 
-def test_roundtrip():
+def cuboid_volume_and_corners(h5m_filename):
+    """Enclosed volume (positive when the triangles point outwards) and the corners used by the triangles."""
+    with h5py.File(h5m_filename) as f:
+        nodes = f['tstt']['nodes']['coordinates']
+        connectivity = f['tstt']['elements']['Tri3']['connectivity'][()].astype(np.int64)
+        points = nodes[()][connectivity - int(np.ravel(nodes.attrs['start_id'])[0])]
+    volume = np.einsum('ij,ij->i', points[:, 0], np.cross(points[:, 1], points[:, 2])).sum() / 6
+    # the stl-file based backends store the coordinates in single precision
+    corners = {tuple(float(x) for x in c) for c in np.round(points.reshape(-1, 3), 6)}
+    return volume, corners, connectivity
+
+@pytest.mark.parametrize('backend', ['stl2', 'db', 'stl2-legacy', 'db-legacy'])
+def test_roundtrip(backend, tmp_path, monkeypatch):
+    if backend.endswith('-legacy'):
+        pytest.importorskip('pymoab')
+    monkeypatch.chdir(tmp_path)
     with open('cuboid001_tmp.step','w') as f:
         f.write(instep)
 
     A=ab.Assembly(['cuboid001_tmp.step'])
-    A.run(backend='stl2',h5m_filename='cuboid001_tmp.h5m')
+    A.run(backend=backend,h5m_filename='cuboid001_tmp.h5m')
     assert pl.Path('cuboid001_tmp.h5m').exists()
+    assert pl.Path('cuboid001_tmp.vtk').exists()
 
-    try:
-        import h5py
-        f0=h5py.File('cuboid001_tmp.h5m')
-        ds1=f0['tstt']['elements']['Tri3']['connectivity']
-        found_h5py = True
-    except:
-        print("Warning: h5py-library not found - skipping check of data in output file")
-        found_h5py = False
-
-    if found_h5py:
-        assert np.all(ds0 == ds1)
-    import os
-    os.unlink('cuboid001_tmp.step')
-    os.unlink('cuboid001_tmp.h5m')
-    os.unlink('cuboid001_tmp.vtk')
+    # the step-file holds a cuboid of 4 x 8 x 16 mm, which becomes two triangles per face, in cm
+    volume, corners, connectivity = cuboid_volume_and_corners('cuboid001_tmp.h5m')
+    assert connectivity.shape == (12, 3)
+    assert corners == {(x, y, z) for x in (0.0, 0.4) for y in (0.0, 0.8) for z in (0.0, 1.6)}
+    assert volume == pytest.approx(0.4 * 0.8 * 1.6)
+    if backend == 'stl2-legacy':
+        # assembled from one stl-file per face, every face has vertices of its own
+        assert np.all(ds0 == connectivity)
 
     print(f"Info: {sys.argv[0]} roundtrip test successful. CAD_to_OpenMC seems to be working as intended.")
 
 if __name__=='__main__':
-    test_roundtrip()
+    sys.exit(pytest.main([__file__]))

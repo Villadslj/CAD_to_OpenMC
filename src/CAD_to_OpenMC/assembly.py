@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import cadquery as cq
 import numpy as np
 import OCP
@@ -10,20 +12,36 @@ import re
 import os
 import math
 import sys
+import tempfile
+import time
 from cadquery import BoundBox
 from unidecode import unidecode
 from datetime import datetime
 
-from pymoab import core, types
+# pymoab is not available from PyPI. It is only needed by the STL-based code
+# paths that assemble the h5m-file through MOAB ('stl', 'gmsh' and the
+# '-legacy' backends), so its absence must not prevent importing the module.
+# Annotations that name its types are not evaluated, see the __future__ import.
+try:
+    from pymoab import core, types
+except ImportError:
+    core = types = None
 
 import CAD_to_OpenMC.assemblymesher as am
 from CAD_to_OpenMC.datadirectory import mesher_datadir
 from CAD_to_OpenMC.check_step import has_degenerate_toroids
+from CAD_to_OpenMC.h5m_io import write_h5m
+from CAD_to_OpenMC.meshed_model import MeshedModel
+from CAD_to_OpenMC.occ_mesher import mesh_and_check
+from CAD_to_OpenMC.options import BACKEND_DEFAULTS, MeshOptions
+from CAD_to_OpenMC.validate import MeshValidationError, check_model
+from CAD_to_OpenMC.vtk_io import write_vtk
 
 try:
     import gmsh
     nogmsh = False
-except ImportError as e:
+except (ImportError, OSError) as e:
+    # the gmsh wheel raises OSError when system libraries such as libGLU are missing
     print(f"Warning: import gmsh failed ({e})- material tag-list, must be supplied.")
     nogmsh = True
 
@@ -39,16 +57,41 @@ mesher_config = {
     "max_mesh_size": 10,
     "curve_samples": 20,
     "mesh_algorithm": 1,
-    "threads": 1,
+    # number of threads. None: all available cores for the stl2 and db backends
+    # (the mesh does not depend on it), a single thread for the other backends.
+    "threads": None,
     "radial_threshold": 0,
     "refine": 0,
     "verbose": 0,
+    # opts of the in-memory mesher behind the stl2 and db backends
+    # 'relative' or 'absolute'. None keeps the meaning each backend always had:
+    # relative to the size of each edge for stl2, an absolute length for db.
+    "tolerance_mode": None,
+    # 'model': mesh all solids together (uses several threads).
+    # 'solid': mesh one solid at a time, as the STL-based pipeline did.
+    "mesh_grouping": "model",
+    # factor on a relative tolerance when several solids are meshed together
+    "relative_tolerance_factor": 0.25,
+    # refuse to write a geometry with untriangulated faces or volumes that are not closed
+    "strict": True,
+    # report solids whose mesh differs more than this fraction in volume from the CAD solid
+    "volume_tolerance": 0.05,
+    # also write a vtk-file of the mesh, to inspect it with e.g. paraview
+    "vtk": True,
 }
 
 
 # these are dummies that we still need to have defined
 def _replace(filename, string1, string2):
     pass
+
+
+def _require_pymoab():
+    if core is None:
+        raise ImportError(
+            "This operation needs pymoab, the python interface of MOAB, which is not installed. "
+            "Meshing with the backends 'stl2' and 'db' works without it."
+        )
 
 
 class Entity:
@@ -293,6 +336,7 @@ class H5MTransformer:
         self.existing_h5m_filename = h5m_filename  # Path to the H5M file
         self.existing_h5m_filepath = os.path.join(os.getcwd(), h5m_filename)
         self.updated_h5m_filepath = h5m_filename.replace(".h5m", "_updated.h5m")
+        _require_pymoab()
         self.moab_core = core.Core()  # Instance of pyMOAB / MOAB to perform operations
 
     def read_h5m_file_data(self) -> None:
@@ -510,18 +554,17 @@ class Assembly:
         self.implicit_complement = implicit_complement
         self.noextract_tags = True
         self.tag_delim_pattern=r"^([^\s_@]+)"
-
-        #check if we can write a moab-detabase.
-        self.dummy_h5m()
+        # the surface mesh and the outcome of its checks, set by the stl2 and db backends
+        self.meshed_model = None
+        self.validation_report = None
 
     def dummy_h5m(self):
+        """Check that MOAB can write a hdf-file; this is what the backends that go through pymoab rely on."""
         mbc, mbt = self.init_moab()
-        mbc.write_file("dummy.h5m")
-        try:
-            self.check_h5m_file("dummy.h5m")
-        except RuntimeError as e:
-            raise e
-        os.unlink("dummy.h5m")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy = str(pl.Path(tmpdir) / "dummy.h5m")
+            mbc.write_file(dummy)
+            self.check_h5m_file(dummy)
         return True
 
     def set_tag_delim(self,delimiters: str):
@@ -824,6 +867,11 @@ class Assembly:
 
     def print_summary(self):
         # output a summary of the meshing results
+        if self.validation_report is not None:
+            print(f'SUMMARY: {"solid_id":8} {"material_tag":16} {"surfaces":>8} {"triangles":>10} {"volume":>12}')
+            for v in self.validation_report.volumes:
+                print(f"SUMMARY: {v.id:8} {v.tag:16} {v.n_surfaces:8} {v.n_triangles:10} {v.mesh_volume:12.6g}")
+            return
         print(f'SUMMARY: {"solid_id":8} {"material_tag":16} {"stl-file":16}')
         for i, a in zip(range(len(self.entities)), self.entities):
             if not isinstance(a.stl, str):
@@ -860,36 +908,132 @@ class Assembly:
         Main processing function that processes the list of already imported entities. It creates a
         mesher backend object as appropriate and calls that to create a surface mesh.
 
+        The backends "stl2" and "db" triangulate all solids in memory with OpenCASCADE, check
+        that every volume is closed, and write the h5m-file directly. The surface mesh and the
+        outcome of the checks are kept in the attributes meshed_model and validation_report.
+        The other backends go through stl-files and pymoab. "stl2-legacy" and "db-legacy" select
+        the stl-file based implementation that "stl2" and "db" used to have.
+
         parameters
         ----------
         h5m_filename: string
             Name of the output file
         backend: string
-            Name of the meshing backend to call. Allowed values are in ["gmsh", "stl", "stl2", "db"]
+            Name of the meshing backend to call. Allowed values are in ["gmsh", "stl", "stl2", "db",
+            "stl2-legacy", "db-legacy"]
         heal: bool
             Use trimesh (if available) to perform a healing step on the surface normals"
+
+        raises
+        ------
+        MeshingError, MeshValidationError
+            (backends "stl2" and "db") If the mesh would leak particles and mesher_config["strict"] is set.
         """
+        if backend in BACKEND_DEFAULTS:
+            return self._solids_to_h5m_in_memory(backend, h5m_filename)
+
+        legacy_backend = backend[: -len("-legacy")] if backend.endswith("-legacy") else backend
+        by_face = legacy_backend in BACKEND_DEFAULTS
+        config = dict(mesher_config)
+        config["entities"] = self.entities
+        # the stl-file based meshers need a number
+        config["threads"] = mesher_config.get("threads") or 1
+        if by_face and config.get("refine"):
+            print(f"WARNING: mesher_config['refine'] has no effect with the '{backend}' backend.")
+            config["refine"] = 0
+        # fail early if MOAB cannot write a hdf-file
+        self.dummy_h5m()
+        self.meshed_model = self.validation_report = None
+
         #if h5m_filename is not in cwd, run where it resides.
         cwd=pl.Path.cwd()
         h5m_path=pl.Path(h5m_filename)
         os.chdir(h5m_path.parent)
-        with mesher_datadir(self._datadir_name(h5m_path.name),self.cleanup, movein=True) as datadir:
-            mesher_config["entities"] = self.entities
-            meshgen = am.meshers.get(backend, **mesher_config)
-            meshgen.set_verbosity(self.verbose)
-            stl_list = meshgen.generate_stls()
+        try:
+            with mesher_datadir(self._datadir_name(h5m_path.name), self.cleanup, movein=True) as datadir:
+                meshgen = am.meshers.get(legacy_backend, **config)
+                meshgen.set_verbosity(self.verbose)
+                stl_list = meshgen.generate_stls()
 
-            for e, s in zip(self.entities, stl_list):
-                e.stl = s
-            if self.verbose:
-                self.print_summary()
-            if backend in [ "stl2", "db" ] :
-                self.stl2h5m_byface(h5m_path.name, True)
-            else:
-                if heal:
-                    stl_list = self.heal_stls(stl_list)
-                self.stl2h5m(stl_list, h5m_path.name, True)
-        os.chdir(cwd)
+                for e, s in zip(self.entities, stl_list):
+                    e.stl = s
+                if self.verbose:
+                    self.print_summary()
+                if by_face:
+                    self.stl2h5m_byface(h5m_path.name, True)
+                else:
+                    if heal:
+                        stl_list = self.heal_stls(stl_list)
+                    self.stl2h5m(stl_list, h5m_path.name, True)
+        finally:
+            os.chdir(cwd)
+
+    def _solids_to_h5m_in_memory(self, backend: str, h5m_filename: str) -> str:
+        """Triangulate all solids with OpenCASCADE, check the mesh, and write the h5m-file."""
+        h5m_path = pl.Path(h5m_filename)
+        if not h5m_path.parent.is_dir():
+            raise FileNotFoundError(f"The directory for the output file does not exist: '{h5m_path.parent}'")
+        if not self.entities:
+            raise RuntimeError("There are no solids to mesh: import step-files with import_stp_files() first.")
+        if mesher_config.get("refine"):
+            print(
+                f"WARNING: mesher_config['refine'] has no effect with the '{backend}' backend. "
+                "Use 'tolerance' and 'angular_tolerance' to get a finer mesh."
+            )
+        options = MeshOptions.from_config(mesher_config, backend)
+        self.meshed_model = self.validation_report = None
+
+        start = time.perf_counter()
+        model, report = mesh_and_check(
+            [e.solid for e in self.entities],
+            [e.tag for e in self.entities],
+            options,
+            names=[getattr(e, "name", None) or "" for e in self.entities],
+            implicit_complement=self.implicit_complement,
+            cad_volumes=[e.solid.Volume() for e in self.entities],
+            volume_rtol=mesher_config.get("volume_tolerance"),
+        )
+        meshed = time.perf_counter()
+        self.meshed_model, self.validation_report = model, report
+        if self.verbose:
+            print(
+                f"INFO: meshed {model.summary()} in {meshed - start:.2f} s "
+                f"with {options.threads} thread{'s' if options.threads > 1 else ''}; "
+                f"largest distance to the CAD surfaces {model.faceting_tolerance:.3g}"
+            )
+            if model.info["vertices_joined_across_gaps"]:
+                print(
+                    f"INFO: {model.info['vertices_joined_across_gaps']} vertices were joined across gaps of at most "
+                    f"{model.info['largest_gap_joined']:.3g} between faces that the CAD model does not connect"
+                )
+            self.print_summary()
+
+        errors, warnings = report.errors(), report.warnings()
+        if errors and options.strict:
+            raise MeshValidationError(
+                f"The mesh is not fit for particle transport, no file was written.\n{report.summary(limit=20)}\n"
+                "Particles get lost in volumes that are not closed. Inspect or repair the parts in the CAD model "
+                "(the attribute validation_report of the assembly holds all details), or set "
+                "mesher_config['strict'] = False to write the file anyway.",
+                report,
+            )
+        if errors or warnings or self.verbose:
+            prefix = "WARNING" if errors or warnings else "INFO"
+            for line in report.summary(limit=20).splitlines():
+                print(f"{prefix}: {line}")
+
+        if self.verbose > 0:
+            print(f'INFO: writing geometry to h5m: "{h5m_filename}".')
+        write_h5m(model, h5m_path)
+        self.check_h5m_file(str(h5m_path))
+        if mesher_config.get("vtk"):
+            if self.verbose > 0:
+                print("INFO: writing geometry to vtk: " + str(h5m_path.with_suffix(".vtk")))
+            write_vtk(model, h5m_path.with_suffix(".vtk"))
+        if self.verbose > 1:
+            timings = ", ".join(f"{k} {v:.2f} s" for k, v in model.info["seconds"].items())
+            print(f"INFO: {timings}, writing {time.perf_counter() - meshed:.2f} s")
+        return str(h5m_path)
 
     def stl2h5m_byface(self, h5m_file: str = "dagmc.h5m", vtk: bool = False) -> str:
         """create a h5m-file with a moab structure and fills
@@ -1149,6 +1293,7 @@ class Assembly:
         (pymoab tag_handle): A pymoab.core.tag_get_handle() instance
         """
         # create pymoab instance
+        _require_pymoab()
         moab_core = core.Core()
 
         tags = dict()
@@ -1454,11 +1599,11 @@ class Assembly:
 
     def get_all_tags(self):
         # extract_all_tags from the list of entities
-        return [e.tag for e in self.entitites]
+        return [e.tag for e in self.entities]
 
     def get_unique_tags(self):
         # extract a set of unique tags
-        return {self.get_all_tags()}
+        return set(self.get_all_tags())
 
 def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verbose: int = 1):
     """
@@ -1472,6 +1617,9 @@ def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verb
         b.run( ... )
         merge2h5m([a,b],h5m_file='c.h5m')
 
+    The assemblies must not overlap, and where they touch they do not share surfaces. They have
+    to be meshed with the "stl2" or "db" backend, which keep the mesh in memory.
+
     paramters
     ---------
     assemblies: list
@@ -1483,12 +1631,38 @@ def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verb
     verbose: int
         If == 0 do not write status messages to console.
     """
+    assemblies = list(assemblies)
+    if not assemblies:
+        raise ValueError("merge2h5m needs at least one assembly")
+    h5m_p = pl.Path(h5m_file)
+    models = [a.meshed_model for a in assemblies]
+    if all(m is not None for m in models):
+        if verbose > 0:
+            print(f"INFO: joining the meshes of {len(models)} assemblies into h5m structure {h5m_file}")
+        model = MeshedModel.concatenate(models)
+        # as before, only the implicit complement of the last assembly counts
+        model.implicit_complement = assemblies[-1].implicit_complement
+        report = check_model(model)
+        for line in report.problems():
+            print(f"WARNING: {line}")
+        if verbose > 0:
+            print(f'INFO: writing geometry to h5m: "{h5m_file}".')
+        write_h5m(model, h5m_p)
+        if vtk:
+            if verbose > 0:
+                print("INFO: writing geometry to vtk: " + str(h5m_p.with_suffix(".vtk")))
+            write_vtk(model, h5m_p.with_suffix(".vtk"))
+        return
+    if any(m is not None for m in models):
+        raise ValueError(
+            "merge2h5m cannot combine assemblies meshed in memory (backends 'stl2' and 'db') with "
+            "assemblies meshed through stl-files. Mesh all of them with the same backend."
+        )
 
     #create a dummy object - this will not actually be used for anything.
     amb=assemblies[0]
     if verbose > 0:
         print(f"INFO: reassembling stl-files into h5m structure {h5m_file}")
-    h5m_p = pl.Path(h5m_file)
     mbcore, mbtags = amb.init_moab()
     all_sets = mbcore.get_entities_by_handle(0)
 

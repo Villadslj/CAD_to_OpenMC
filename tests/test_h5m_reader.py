@@ -24,7 +24,7 @@ def workdir(tmp_path, monkeypatch):
 def test_reads_geometry_written_by_moab(workdir):
     a = ab.Assembly([str(ROOT / "tests" / "7pin.step")], verbose=0)
     a.implicit_complement = "water"
-    a.run(backend="stl2", merge=True, h5m_filename="pins.h5m")
+    a.run(backend="stl2-legacy", merge=True, h5m_filename="pins.h5m")
 
     model = read_h5m("pins.h5m")
     assert model.volume_tags == ["fuel"] * 7 + ["graphite"] * 7
