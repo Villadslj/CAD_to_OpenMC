@@ -147,6 +147,11 @@ a=ab.Assembly()
 a.set_tag_delim("\s@")
 ```
 
+The names of the parts are read from the step-file together with the shapes. All solids of a part get the name of that part. Up to version 1.0 the names were found by importing the file a second time with gmsh, which took most of the import time for files with many parts, and did not find a name for the solids of a part that consists of several bodies. That way of finding the names is still available:
+```python
+a.names_from='gmsh'
+```
+
 ## implicit complement
 CAD_to_OpenMC supports the notion of an implicit complement material, i.e. a material that fills all the space within the geometry which has _not_ been claimed by any part in the CAD-assembly. For instance if one wanted to submerge a pincell in in water it is possible to only define the pincell as part and set the implicit complement material to water. To do so we would use code like:
 ```python

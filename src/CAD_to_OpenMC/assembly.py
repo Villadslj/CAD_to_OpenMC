@@ -34,6 +34,7 @@ from CAD_to_OpenMC.h5m_io import write_h5m
 from CAD_to_OpenMC.meshed_model import MeshedModel
 from CAD_to_OpenMC.occ_mesher import mesh_and_check
 from CAD_to_OpenMC.options import BACKEND_DEFAULTS, MeshOptions
+from CAD_to_OpenMC.step_reader import StepFile
 from CAD_to_OpenMC.validate import MeshValidationError, check_model
 from CAD_to_OpenMC.vtk_io import write_vtk
 
@@ -112,19 +113,63 @@ class Entity:
         The index number of the part/solid.
     tag : string
         Material tag of the part/solid
+    name : string
+        Name of the part in the step-file
+
+    The bounding box (bb), the center and the volume of the solid are computed when they are first
+    asked for.
     """
 
-    def __init__(self, solid=None, idx=0, tag="vacuum"):
+    def __init__(self, solid=None, idx=0, tag="vacuum", name=""):
+        self._solid = None
+        self._properties = {}
         if solid is not None:
             self.solid = solid
             self.idx = idx
             self.tag = tag
-            # extract some parameters from the solid for later.
-            self.bb = solid.BoundingBox()
-            self.center = solid.Center()
-            self.volume = solid.Volume()
+            self.name = name
             # When availalble, the bounding box in the entire assembly for every part made of this material is stored
             self.material_bounds_in_assembly: BoundBox | None = None
+
+    @property
+    def solid(self):
+        return self._solid
+
+    @solid.setter
+    def solid(self, solid):
+        if solid is not self._solid:
+            # what was computed belongs to the previous solid
+            self._properties = {}
+        self._solid = solid
+
+    def _property(self, name, compute):
+        if name not in self._properties:
+            self._properties[name] = compute()
+        return self._properties[name]
+
+    @property
+    def bb(self):
+        return self._property("bb", self.solid.BoundingBox)
+
+    @bb.setter
+    def bb(self, value):
+        self._properties["bb"] = value
+
+    @property
+    def center(self):
+        return self._property("center", self.solid.Center)
+
+    @center.setter
+    def center(self, value):
+        self._properties["center"] = value
+
+    @property
+    def volume(self):
+        return self._property("volume", self.solid.Volume)
+
+    @volume.setter
+    def volume(self, value):
+        self._properties["volume"] = value
 
     def get_cms_relative_distance(
         self,
@@ -554,6 +599,9 @@ class Assembly:
         self.implicit_complement = implicit_complement
         self.noextract_tags = True
         self.tag_delim_pattern=r"^([^\s_@]+)"
+        # where the names of the parts come from: "step" reads them from the step-file itself,
+        # "gmsh" asks gmsh for them, which is slow for files with many parts.
+        self.names_from = "step"
         # the surface mesh and the outcome of its checks, set by the stl2 and db backends
         self.meshed_model = None
         self.validation_report = None
@@ -645,59 +693,37 @@ class Assembly:
         tags_set = 0
         # clear list to avoid double-import
         self.entities = []
+        self.meshed_model = self.validation_report = None
 
-        message = "Need gmsh python module installed to extract material tags from step-file. please supply a 'sequential_tags'-list instead"
-        assert (nogmsh and tags is None and sequential_tags is not None) or (
-            not nogmsh
-        ), message
-        # if no gmsh module was imported we must rely on explicit sequential tags, so check they're there.
         i = 1
         for stp in self.stp_files:
-            solid = self.load_stp_file(stp, scale, translate, rotate)
+            solid, names = self._load_stp_file(stp, scale, translate, rotate)
 
+            # the solids that are kept, each with the name of its part and its number in the file
             ents = []
-            # try if solid is iterable
-            try:
-                for j in range(len(solid)):
-                    if j + i not in vol_skip:
-                        s = solid[j]
-                        e = Entity(solid=s)
-                        ents.append(e)
-                i = i + len(solid)
-            except Exception as _e:
-                e = Entity(solid=solid)
-                ents.append(e)
+            for j, (s, name) in enumerate(zip(solid, names)):
+                if j + i not in vol_skip:
+                    ents.append(Entity(solid=s, idx=j + 1, name=name))
+            i = i + len(solid)
 
             if tags is None and sequential_tags is None:
-                # also import using gmsh to extract the material tags from the labels in the step files
-                gmsh.initialize()
-                vols = gmsh.model.occ.importShapes(stp)
-                gmsh.model.occ.synchronize()
-                for e, v in zip(ents, vols):
-                    vid = v[1]
+                # extract the material tags from the names of the parts in the step files
+                for e in ents:
                     try:
-                        s = gmsh.model.getEntityName(3, vid)
-                        part = s.split("/")[-1]
-                        g = re.match(self.tag_delim_pattern, part)
+                        g = re.match(self.tag_delim_pattern, e.name)
                         tag = unidecode(g[0])
                         if self.verbose > 1:
                             print(
-                                f"INFO: Tagging volume #{vid} label:{s} with material {tag}"
+                                f"INFO: Tagging volume #{e.idx} label:{e.name} with material {tag}"
                             )
                     except Exception as _e:
                         tag = default_tag
                     e.tag = tag
                     tags_set = tags_set + 1
-                gmsh.finalize()
             elif tags:
                 # tag objects according to the tags dictionary.
-                gmsh.initialize()
-                vols = gmsh.model.occ.importShapes(stp)
-                gmsh.model.occ.synchronize()
-                for e, v in zip(ents, vols):
-                    vid = v[1]
-                    s = gmsh.model.getEntityName(3, vid)
-                    part = s.split("/")[-1]
+                for e in ents:
+                    part = e.name
                     tag = None
                     for k in tags.keys():
                         if match_anywhere:
@@ -725,9 +751,8 @@ class Assembly:
                     e.tag = tag
                     if self.verbose > 1:
                         print(
-                            f"INFO: Tagging volume #{vid} label:{s} with material {tag}"
+                            f"INFO: Tagging volume #{e.idx} label:{part} with material {tag}"
                         )
-                gmsh.finalize()
             elif sequential_tags:
                 for e, t in zip_longest(
                     ents, sequential_tags[tags_set:], fillvalue=self.default_tag
@@ -794,8 +819,19 @@ class Assembly:
         Returns:
             [CadQuery.solid]
         """
+        return self._load_stp_file(filename, scale_factor, translate, rotate)[0]
+
+    def _load_stp_file(self, filename, scale_factor, translate, rotate):
+        """The solids of a step-file, and for every solid the name of the part it belongs to."""
         # import _all_ the shapes in the file - i.e. may return a list
-        part = cq.importers.importStep(str(filename)).vals()
+        step = StepFile(filename)
+        part = [cq.Shape.cast(shape) for shape in step.shapes]
+        if self.names_from == "gmsh":
+            names = self._names_from_gmsh(filename)
+        elif self.names_from == "step":
+            names = step.solid_names()
+        else:
+            raise ValueError(f"names_from must be 'step' or 'gmsh', got {self.names_from!r}")
 
         # apply apply_transforms
         scaled_part = self.apply_transforms(
@@ -811,7 +847,21 @@ class Assembly:
         except Exception as _e:
             solid.extend(scaled_part.Solids())
 
-        return solid
+        # solids without a name get the default tag
+        names = list(names) + [""] * (len(solid) - len(names))
+        return solid, names
+
+    def _names_from_gmsh(self, filename):
+        """The names of the parts as gmsh reports them: the way the tags were found up to version 1."""
+        if nogmsh:
+            raise ImportError("names_from = 'gmsh' needs the gmsh python module, which could not be imported")
+        gmsh.initialize()
+        try:
+            vols = gmsh.model.occ.importShapes(str(filename))
+            gmsh.model.occ.synchronize()
+            return [gmsh.model.getEntityName(3, v[1]).split("/")[-1] for v in vols]
+        finally:
+            gmsh.finalize()
 
     def apply_transforms(self, part, filename, scale_factor, translate, rotate):
         # scale the shapes even if the factor is 1.
