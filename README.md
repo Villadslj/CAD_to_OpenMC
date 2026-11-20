@@ -165,17 +165,30 @@ meanings:
     <dt>vetoed</dt>
         <dd>A list of surfaces that should be excluded from meshing. Useful when some surface fails for whatever reason. Be aware that this may make your geometry non-watertight.</dd>
     <dt>threads</dt>
-        <dd>The number of threads to be used to speed up the meshing algorithms. Useful for multicore-computers.</dd>
+        <dd>The number of threads used for meshing. The default, None, uses all available cores with the stl2 and db backends, where the mesh does not depend on the number of threads, and a single thread with the other backends.</dd>
     <dt>tolerance</dt>
-        <ddRelative mesh tolerance (stl/stl2 backends). Lower this to get a finer mesh.</dd>
+        <dd>Mesh tolerance: the largest allowed distance between the mesh and the CAD surface. Lower this to get a finer mesh. For the stl and stl2 backends it is relative to the size of each edge, for the db backend it is a distance in cm (see tolerance_mode).</dd>
     <dt>angular_tolerance</dt>
-        <dd>Relative angular mesh tolerance (stl/stl2 backends) Lower this to get a better angular resolution.</dd>
+        <dd>Angular mesh tolerance in radians (stl/stl2/db backends). Lower this to get a better angular resolution.</dd>
+    <dt>tolerance_mode</dt>
+        <dd>'relative' or 'absolute' (stl2/db backends). Sets how the tolerance is to be understood. The default, None, means relative for stl2 and absolute for db.</dd>
+    <dt>mesh_grouping</dt>
+        <dd>(stl2/db backends) 'model', the default, meshes all solids in one go, which is what makes use of several threads. 'solid' meshes one solid at a time, smallest first.</dd>
+    <dt>relative_tolerance_factor</dt>
+        <dd>(stl2/db backends) Factor on a relative tolerance when several solids are meshed in one go. The default of 0.25 makes sure that no part is meshed coarser than it would be on its own, which can give more triangles than earlier versions did. Set it to 1, or set mesh_grouping to 'solid', to get the mesh density of earlier versions.</dd>
+    <dt>strict</dt>
+        <dd>(stl2/db backends) If True, the default, an error is raised and no file is written when a volume is not closed, since particles would get lost in it. Set it to False to get the file anyway, with warnings.</dd>
+    <dt>volume_tolerance</dt>
+        <dd>(stl2/db backends) Warn about solids whose mesh differs by more than this fraction in volume from the CAD solid. The default is 0.05.</dd>
+    <dt>vtk</dt>
+        <dd>(stl2/db backends) Also write a vtk-file of the mesh. The default is True.</dd>
     <dt>refine</dt>
         <dd>After the initial meshing step is done, should the mesh be refined?
 
 This option has more than one meaning depending on which backend you have chosen.
-- If the cq/stl-backend is active and the *refine* option is non-zero or True, the mesh-refinment tool (mmg)[https://www.mmgtools.org] is called in sequence on each surface.
-- If the gmsh-backend is active and the *refine* option is non-zero the gmsh-refinement tool is called on the full geometry the given number of times. A value of True is the same as setting the option to 1, i.e. it triggers a single loop through the refinement algorithm.</dd>
+- If the stl-backend is active and the *refine* option is non-zero or True, the mesh-refinment tool (mmg)[https://www.mmgtools.org] is called in sequence on each surface.
+- If the gmsh-backend is active and the *refine* option is non-zero the gmsh-refinement tool is called on the full geometry the given number of times. A value of True is the same as setting the option to 1, i.e. it triggers a single loop through the refinement algorithm.
+- It has no effect with the stl2 and db backends. Lower the tolerances to get a finer mesh.</dd>
    <dt>verbose</dt>
       <dd>Output lots of information from the mesher backends.</dd>
 </dl>
@@ -200,11 +213,23 @@ The inner workings of this backend is basically a simple call to gmsh to create 
 The stl backend takes a different approach. Instead each solid object in a step geometry is triangulated on its own. The triangulation itself is performed by calls to the underlying OpenCASCADE-library through the python layer cadquery. This procedure sidesteps the problem with large geometries, as each object in handled on its own. Objects cannot overlap however, and just as the case is for the gmsh-backend, surfaces should not be coincident.
 
 ### stl2
-As its name implies the stl2 backend builds on concepts from the stl backend. However a major difference lies in the fact that objects can now have coincident surfaces. This is achieved by splitting the tringulation operation further and instead perform it in a face-by-face manner. This way we may skip the operation is one face (or surface) is a part of two solids. Furthermore, when the surfaces are assembled into a h5m datafile, the surfaces may be appropriately flagged such that transport algorithms can handle moving from one to another. If this is important for your problem, then this is the backend you should use.
+As its name implies the stl2 backend builds on concepts from the stl backend. However a major difference lies in the fact that objects can now have coincident surfaces: a face that is part of two solids is triangulated once, and it is flagged in the h5m datafile such that transport algorithms can handle moving from one solid to the other. If this is important for your problem, then this is the backend you should use.
+
+The triangulation is kept in memory. All solids are handed to OpenCASCADE together, so every edge is divided exactly once and the triangles on either side of it always fit, whatever the order of the solids and the number of threads. No stl-files are written, and the h5m-file is written directly, for which pymoab is not needed. Before the file is written it is checked that every volume is closed, see "Checking the mesh" below. The implementation of earlier versions, which goes through one stl-file per face, is available as the backend 'stl2-legacy'.
 
 ### db
-This meshing backend is based on the DellaBella meshing algorithm. On our test cases it tends to produce meshes that are qualitatively similar to what the 'stl2'-backend will generate. In cases however it can be more reliable, and may be able to generate watertight models with less polygons, leading to smaller files.
-This backend is experimental in that installation can be tricky, since it requires a very new version of cadquery-ocp (7.7.2.1), not yet available through the pip-ecosystem. It may be installed using conda/mamba, but keep in mind that you actively have to avoid reinstalling cadquery-ocp thourhg pip. This can be accomplished by means of installing the dependencies manually (look to pyproject.toml) and lastly install cad_to_openmc using ```pip install --no-deps CAD_to_OpenMC```
+This meshing backend is based on the DellaBella meshing algorithm. It works the same way as the 'stl2'-backend, but takes the tolerance as a distance instead of relative to the size of each edge. On our test cases it tends to produce meshes that are qualitatively similar to what the 'stl2'-backend will generate. In cases however it can be more reliable, and may be able to generate watertight models with less polygons, leading to smaller files.
+It requires cadquery-ocp 7.7.2 or newer. The implementation of earlier versions is available as the backend 'db-legacy'.
+
+## Checking the mesh
+With the stl2 and db backends the mesh is checked before the h5m-file is written: every volume has to be bounded by a closed and consistently oriented set of triangles, since particles get lost in volumes that are not. If that is not the case an error is raised that names the parts in question, and no file is written. Set ```ab.mesher_config['strict']=False``` to get the file anyway.
+
+The outcome of the checks, including the volume of every solid and of its mesh, is kept on the assembly:
+```python
+a.run(backend='stl2', h5m_filename='geometry.h5m')
+print(a.validation_report.summary())
+```
+Any h5m-file, also one written by other tools, can be checked from the command line with ```python -m CAD_to_OpenMC.validate geometry.h5m```.
 
 ## tag delimiter
 As of 0.3.6 it is possible to manipulate the delimiter used when extracting material tags from part names. By default the regexp used is "\s_@" meaning to split on whitespace, underscores and @. E.g. this will make parts "dr_bunsen" and "dr_beaker" be tagged with "dr". If however the method "set_tag_delim" is called on an assembly object with an argument "\s@" this results in the parts being tagged "dr_bunsen" and "dr_beaker".
@@ -226,6 +251,7 @@ Of course, this means that the subsequent OpenMC transport simulation needs to d
 
 ## Intermediate datafiles
 In the process of generating an .h5m-geometry file CAD_to_OpenMC also generates a sometimes large amount of intermediary datafiles, these may be retained for debugging purposes (the default), but by setting a flag, CAD_to_OpenMC can be directed to delete them automatically once they're no longer needed. Since version 0.3 the intermediate datafiles are put in a newly created subdirectory, named <h5m_file_stem>_DATE_TIME.
+The stl2 and db backends keep everything in memory and do not write intermediate datafiles.
 The cleanup-flag is set as such:
 ```python
 import CAD_to_OpenMC.assembly as ab
@@ -247,6 +273,7 @@ Two.run(backend='stl2', merge=True, h5m_filename='two.h5m')
 ab.merge2h5m([One,Two],h5m_file='three.h5')
 ```
 This will run the normal triangulization procedure for one and two separately, but also create a single h5m-file: three.h5m which contains both of the geometries.
+The assemblies have to be meshed with the 'stl2' or 'db' backend.
 
 # Advanced example
 For a more advanced example of the use of CAD_to_OpenMC and OpenMC we may turn to the Zero Power Reactor Experiment. This was a full-scale reactor experiment that was carried out at Oak Rodge TN in the 1960's. Copenhagen Atomics provides a CAD-drawn model of this experiment, extracted from the original reports and drawings from the original experiment, in the form of a step-file. To get access simply clone the zpre github repository and run the scripts:
