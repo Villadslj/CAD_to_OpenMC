@@ -6,13 +6,11 @@ from typing import List, Optional, Union
 
 from itertools import zip_longest
 
-import trimesh
-
 import re
 import os
 import math
 import sys
-
+from cadquery import BoundBox
 from unidecode import unidecode
 from datetime import datetime
 
@@ -54,11 +52,23 @@ def _replace(filename, string1, string2):
 
 
 class Entity:
-    """This class is a shallow container simply to allow iterating of the geometry model
-    where each object is merely a solid and a material tag.
-    This is to emulate some properties of the paramak shape class, but avoid depending on that.
-    At some point it should be able to import also Shapes.
-    For now it can just get a solid as input
+    """
+    Container class for Parts / Volumes
+
+    This class is a container to allow iterating through the geometry model, storing links to
+    data as we go along.
+    Each Entity is a glue-object that connects a step part with a h5m-volume, including positioning,
+    material tags, and links to surface mesh.
+
+
+    Parameters
+    ----------
+    solid : cadquery:Solid
+        The cadquery Solid object corresponding to the step-part
+    idx : int
+        The index number of the part/solid.
+    tag : string
+        Material tag of the part/solid
     """
 
     def __init__(self, solid=None, idx=0, tag="vacuum"):
@@ -70,70 +80,136 @@ class Entity:
             self.bb = solid.BoundingBox()
             self.center = solid.Center()
             self.volume = solid.Volume()
+            # When availalble, the bounding box in the entire assembly for every part made of this material is stored
+            self.material_bounds_in_assembly: BoundBox | None = None
 
-    def similarity(
+    def get_cms_relative_distance(
         self,
-        center: tuple = (0, 0, 0),
-        bb: tuple = (0, 0, 0),
-        volume: float = 1,
-        tolerance=1e-2,
-    ) -> bool:
-        """method returns a value for the similarity between the entity and the 3 parameters
-        cms, bb, and volume"""
-        cms_rel_dist = np.linalg.norm(
-            [
-                self.center.x - center[0],
-                self.center.y - center[1],
-                self.center.z - center[2],
-            ]
-        ) / np.linalg.norm(center)
-        bb_rel_dist = np.linalg.norm(
-            [self.bb.xlen - bb[0], self.bb.ylen - bb[1], self.bb.zlen - bb[2]]
-        ) / np.linalg.norm(bb)
-        vol_rel_dist = np.abs(self.volume - volume) / volume
-        return cms_rel_dist + bb_rel_dist + vol_rel_dist
-
-    def similar(
-        self,
-        center: tuple = (0, 0, 0),
-        bb: tuple = (0, 0, 0),
-        volume: float = 1,
-        tolerance=1e-2,
-    ) -> bool:
-        """method checks whether the entity can be regard as similar with another entities parameters"""
-        cms_close = (
-            np.linalg.norm(
+        center: tuple = (0, 0, 0)):
+        """
+        Calculates the relative distance between the object's center and a given center point.
+        The distance is computed as the Euclidean norm between the object's center coordinates
+        and the provided `center` tuple, normalized by the norm of the `center` itself.
+        """
+            
+        try:
+            relative_distance = np.linalg.norm(
                 [
                     self.center.x - center[0],
                     self.center.y - center[1],
                     self.center.z - center[2],
                 ]
-            )
-            / np.linalg.norm(center)
-            < tolerance
+            ) / np.linalg.norm(center)
+        except ZeroDivisionError:
+            relative_distance = float('inf')
+        return relative_distance
+        
+
+    def get_bounding_box_relative_distance(
+        self,
+        bb: tuple = (0, 0, 0)):
+            
+        """
+        Calculates the relative distance between the bounding box of the current object and a given bounding box.
+        The distance is computed as the Euclidean norm of the difference between the dimensions of the current object's bounding box (`self.bb`) and the provided bounding box (`bb`), normalized by the norm of the provided bounding box dimensions.
+        """
+        try:
+            relative_distance = np.linalg.norm(
+                [self.bb.xlen - bb[0], self.bb.ylen - bb[1], self.bb.zlen - bb[2]]
+            ) / np.linalg.norm(bb)
+        except ZeroDivisionError:
+            relative_distance = float('inf')
+        return relative_distance
+
+    def get_volume_relative_distance(self,
+        volume: float = 1):
+        """
+        Calculate the relative distance between the object's volume and a given volume.
+        Parameters:
+            volume (float, optional): The reference volume to compare against. Defaults to 1.
+        Returns:
+            float: The absolute relative difference between the object's volume and the given volume.
+        """
+        
+        return np.abs(self.volume - volume) / volume
+
+    def get_similarity_score(
+        self,
+        center: tuple = (0, 0, 0),
+        bb: tuple = (0, 0, 0),
+        volume: float = 1,
+        tolerance=1e-2,)->float:       
+        """
+        Calculates a similarity score based on the relative distances of the center of mass, bounding box, and volume 
+        compared to provided reference values.
+        Args:
+            center (tuple, optional): Reference center of mass coordinates. Defaults to (0, 0, 0).
+            bb (tuple, optional): Reference bounding box dimensions or coordinates. Defaults to (0, 0, 0).
+            volume (float, optional): Reference volume. Defaults to 1.
+            tolerance (float, optional): Tolerance value for similarity calculations. Defaults to 1e-2.
+        Returns:
+            float: The sum of the relative distances for center of mass, bounding box, and volume as a similarity score.
+        """
+        cms_rel_dist = self.get_cms_relative_distance(center = center)
+        bb_rel_dist = self.get_bounding_box_relative_distance(bb = bb)
+        vol_rel_dist = self.get_volume_relative_distance(volume = volume)
+        return cms_rel_dist + bb_rel_dist + vol_rel_dist
+
+    def object_is_similar(self, center: tuple = (0, 0, 0), bb: tuple = (0, 0, 0), volume: float = 1, tolerance=1e-2) -> bool:
+
+        """
+        Determines if the current object is similar to another based on center of mass, bounding box, and volume.
+
+        Args:
+            center (tuple, optional): The reference center of mass coordinates (x, y, z). Defaults to (0, 0, 0).
+            bb (tuple, optional): The reference bounding box dimensions. Defaults to (0, 0, 0).
+            volume (float, optional): The reference volume. Defaults to 1.
+            tolerance (float, optional): The maximum allowed relative difference for similarity. Defaults to 1e-2.
+
+        Returns:
+            bool: True if the center of mass, bounding box, and volume are all within the specified tolerance; False otherwise.
+        """
+        cms_close = (
+            self.get_cms_relative_distance(center = center) < tolerance
         )
         bb_close = (
-            np.linalg.norm(
-                [self.bb.xlen - bb[0], self.bb.ylen - bb[1], self.bb.zlen - bb[2]]
-            )
-            / np.linalg.norm(bb)
-            < tolerance
+            self.get_bounding_box_relative_distance(bb = bb) < tolerance
         )
-        vol_close = np.abs(self.volume - volume) / volume < tolerance
+        vol_close = self.get_volume_relative_distance(volume = volume) < tolerance
         return cms_close and bb_close and vol_close
 
+
     def export_stp(self):
-        """export the entity to a step-file using its tag as filename through cadquery export"""
+        """
+        Not yet implemented
+        """
         pass
 
 
 def idx_similar(entity_list, center, bounding_box, volume):
-    """returns the index in the solid_list for which a solid is similar in terms of bounding box, cms, and volume
-    If no similar object is found return -1.
+    """
+    Which objects (if any) are similar to the object specified by the set of parameters
+
+    Parameters
+    ----------
+    entity_list : List
+        List of entities to check agains the given parameters
+    center :
+        The center coordinate to compare with
+    bb :
+        Bounding box to compare with
+    volume :
+        Volume to compare with
+
+    Returns
+    -------
+    int
+        The index in the entity_list for which a solid is similar in terms of bounding box, cms, and volume
+        If no similar object is found return -1.
     """
     idx_found = []
     for i, ent in enumerate(entity_list):
-        if ent.similar(
+        if ent.object_is_similar(
             [center.x, center.y, center.z],
             [bounding_box.xlen, bounding_box.ylen, bounding_box.zlen],
             volume,
@@ -144,7 +220,7 @@ def idx_similar(entity_list, center, bounding_box, volume):
         # we have multiple matches - pick the best one
         dsmall = 1e9
         for i, ent in enumerate([entity_list[idx] for idx in idx_found]):
-            d = ent.similarity(
+            d = ent.get_similarity_score(
                 [center.x, center.y, center.z],
                 [bounding_box.xlen, bounding_box.ylen, bounding_box.zlen],
                 volume,
@@ -181,11 +257,236 @@ def similar_solids(solid1_vol, solid1_bb, solid1_c, solid2_vol, solid2_bb, solid
     )
     return dV + dBB + dCntr
 
+
+class H5MTransformer:
+    """
+    H5MTransformer is a class for manipulating H5M files using the pyMOAB/MOAB core library.
+
+    Parameters:
+    verbose : int
+        verbosity level of output. 0: most quiet, 1: some output, 2+: a lot of diagnostic output
+
+    Attributes:
+        existing_h5m_filepath (str): Path to the original H5M file.
+        updated_h5m_filepath (str): Path to the updated H5M file to be written.
+        moab_core: Instance of pyMOAB/MOAB core used for file operations.
+
+    Methods:
+        __init__(h5m_filename: str):
+            Initializes the transformer with the specified H5M file path.
+
+        read_h5m_file_data() -> None:
+            Loads the H5M file into the MOAB core.
+
+        get_entity_by_id(entity_id: int):
+            Retrieves an entity from the H5M file by its unique ID.
+
+        retag_entity(material_tag: str, new_material_tag: str, entity_id: int):
+
+        write_updated_h5m_file() -> None:
+            Writes the updated H5M file to disk.
+
+    """
+
+    def __init__(self, h5m_filename: str, verbose: int = 1):
+        self.verbose = verbose
+        self.existing_h5m_filename = h5m_filename  # Path to the H5M file
+        self.existing_h5m_filepath = os.path.join(os.getcwd(), h5m_filename)
+        self.updated_h5m_filepath = h5m_filename.replace(".h5m", "_updated.h5m")
+        self.moab_core = core.Core()  # Instance of pyMOAB / MOAB to perform operations
+
+    def read_h5m_file_data(self) -> None:
+        """
+        This method reads the H5M file specified by h5m_filepath.
+        """
+        self.moab_core.load_file(self.existing_h5m_filepath)
+
+    def get_entity_by_id(self, entity_id: int) -> Union[np.uint64 , None]:
+        """
+        This method retrieves an entity from the H5M file by its ID.
+        Args:
+            entity_id (int): The ID of the entity to retrieve.
+        Returns:
+            The entity object if found, None otherwise.
+        """
+        all_entities = self.moab_core.get_entities_by_handle(0)  # 0 is the root set
+        for entity in all_entities:
+            if entity == entity_id:
+                print(type(entity))
+                return entity
+        return None
+
+    def retag_entity(self, new_material_tag: str, entity_id: int):
+        """
+        Updates the material tag of a specified entity.
+        Parameters:
+            new_material_tag (str): The new material tag to assign to the entity.
+            entity_id (int): The unique identifier of the entity to be retagged.
+        Returns:
+            None
+        """
+        entity = self.get_entity_by_id(entity_id)
+        if entity is None:
+            print(f"ERROR: Entity with ID {entity_id} not found.")
+            return
+        tag_handles = self.moab_core.tag_get_tags_on_entity(entity)
+        for tag_handle in tag_handles:
+            tag_name = tag_handle.get_name()
+            if tag_name == types.NAME_TAG_NAME:
+                # Update the material tag
+                self.moab_core.tag_set_data(tag_handle, [entity], [[new_material_tag]])
+                if self.verbose > 1:
+                    print(f"INFO: Updated entity {entity_id} with new material tag '{new_material_tag}'")
+                return
+        if self.verbose > 0:
+            print(f"WARNING: Material tag not found on entity {entity_id}. No changes made.")
+
+    def write_updated_h5m_file(self) -> None:
+        """
+        This method writes the updated H5M file to disk.
+        """
+        self.moab_core.write_file(self.updated_h5m_filepath)
+
+    def get_all_entity_ids(self) -> list[np.uint64]:
+        """
+        This method retrieves all entity IDs from the H5M file.
+        Returns:
+            List of entity IDs.
+        """
+        all_entities = self.moab_core.get_entities_by_handle(0)  # 0 is the root set
+        entity_ids = list(all_entities)
+        if self.verbose > 0:
+            print(f"INFO: Found {len(entity_ids)} entities in the H5M file.")
+
+        return entity_ids
+
+    def get_all_materials(self) -> list[str]:
+        """
+        This method retrieves all unique material tags from the H5M file.
+        Returns:
+            List of unique material tags.
+        """
+        all_entities = self.moab_core.get_entities_by_handle(0)  # 0 is the root set
+        material_tags = set()
+        for entity in all_entities:
+            tag_handles = self.moab_core.tag_get_tags_on_entity(entity)
+            if self.verbose >= 2:
+                print(
+                    f"DEBUG: Entity {entity} has tags {[tag.get_name() for tag in tag_handles]}"
+                )
+
+            tag_data = {}
+            for tag_handle in tag_handles:
+                tag_name = tag_handle.get_name()
+                if not tag_name:
+                    print(
+                        f"WARNING: tag_handle does not have get_name() method: {tag_handle}"
+                    )
+                    continue
+
+                if tag_name == types.NAME_TAG_NAME:
+                    tag_data = self.moab_core.tag_get_data(tag_handle, [entity])
+
+                    nested_tag_list = tag_data.tolist()
+                    # normalize the list of lists
+                    normalized_tag_list = [
+                        tag.strip()
+                        for sublist in nested_tag_list
+                        for tag in sublist
+                        if tag.strip()
+                    ]
+
+                    for tag in normalized_tag_list:
+                        material_tags.add(tag)
+        if self.verbose > 0:
+            print(f"INFO: Found {len(material_tags)} unique materials in the H5M file.")
+        if self.verbose >= 2:
+            print(f"DEBUG: Unique materials are: {material_tags}")
+        return list(material_tags)
+
+    def get_all_entities_of_material(self, material_tag: str) -> list[int]:
+        """
+        Retrieves all entity IDs associated with a given material tag.
+        Parameters:
+            material_tag (str): The material tag to search for.
+        Returns:
+            List of entity IDs associated with the material.
+        """
+        all_entities = self.moab_core.get_entities_by_handle(0)  # 0 is the root set
+        matching_entity_ids = []
+        for entity in all_entities:
+            tag_handles = self.moab_core.tag_get_tags_on_entity(entity)
+            for tag_handle in tag_handles:
+                tag_name = tag_handle.get_name()
+                if tag_name == types.NAME_TAG_NAME:
+                    tag_data = self.moab_core.tag_get_data(tag_handle, [entity])
+                    nested_tag_list = tag_data.tolist()
+                    normalized_tag_list = [
+                        tag.strip()
+                        for sublist in nested_tag_list
+                        for tag in sublist
+                        if tag.strip()
+                    ]
+                    if material_tag in normalized_tag_list:
+                        matching_entity_ids.append(entity)
+                        break
+        if self.verbose > 0:
+            print(
+                f"INFO: Found {len(matching_entity_ids)} entities for material '{material_tag}'."
+            )
+        return matching_entity_ids
+
 class Assembly:
-    """This class encapsulates a set of geometries defined by step-files
-    addtionally it provides access to meshing-utilities, and export to a DAGMC-enabled
-    h5m scene, which may be used for neutronics.
-    This class is based on (and borrows heavily from) logic from the paramak package.
+    """
+    Main class representing a geometry model to process
+
+    This class encapsulates a geometry defined by a set of step-files that are to be converted
+    into a single surface-meshed geometry.
+    N.b. if geometries are not overlapping it may be simple to use a single Assembly-object per
+    step-file and merge them later using the merge_h5m-methiod.
+
+    Parameters
+    ----------
+    stp_files : 
+        List of filenames of the step-files to be processed. Most often this is a lits with single member
+    verbose : int
+        verbosity level of output. 0: most quiet, 1: some output, 2+: a lot of diagnostic output
+    default_tag : str
+        Material tag to apply to objects where none is found or where no tag-conversion is applicable
+    implicit_complement : str or None
+        Material tag to be applied to the volume _not_ claimed by any object. If set to None, it is ignored.
+
+    Attributes
+    ----------
+    stp_files : List
+        List of filenames of the step-files to be processed.
+    verbose : int
+        verbosity level of output. 0: most quiet, 1: some output, 2+: a lot of diagnostic output
+    default_tag : string
+        Material tag to apply to objects where none is found or where no tag-conversion is applicable
+    delete_intermediate : bool
+        Should intermediate data-files be deleted after finishing a run? Superceded by "cleanup"
+    cleanup : bool
+        Delete the data-directory containing the intermediate data-files?
+    datadir : string
+        Data directory where intermediate data is stored. If == "." (default) a unique directory will be created
+    tags : dictionary
+        Dictionary of material tag-conversions to be applied after extracting tags from the step-file(s). Keys
+        are expected to be regexp-patterns to be matched agains the extracted tags (see also set_tag_delim), and
+        values are the atcual tags to be set. E.g. tags = {"steel.*" : "niobium"} will replace all tags starting with
+        "steel" with the tag "niobium".
+    sequential_tags : list
+        List of tages to be applied sequentially to a model. If set, this applies the tags in the list in the sequence
+        they are encountered in the step-file, until either one is exhausted. If the seq. tag list is exhausted,
+        remaining objects will retain the tag extracted from the step-file or get the default depending on whether
+        noextract_tags is set.
+    implicit_complement : string
+        Material tag to be applied to the volume _not_ claimed by any object.
+    noextract_tags : bool
+        If true, do not extract materials tags from the step-files to fill up.
+    tag_delim_pattern : string
+        Regex-pattern which determines what the constitutes the first section of a part name. The first bit is the
+        extracted material tag. E.g. with default setting, the names "steel pipe" and "steel_pipe" both become the tag "steel".
     """
 
     def __init__(
@@ -210,22 +511,8 @@ class Assembly:
         self.noextract_tags = True
         self.tag_delim_pattern=r"^([^\s_@]+)"
 
-
-    @classmethod
-    def hdf5_in_moab(cls):
-        a = Assembly()
-        try:
-            a.dummy_h5m()
-        except RuntimeError as e:
-            print(
-                "Warning: Can't write a hdf-file. Did you compile moab with hdf5 support?"
-                "The resulting meshed file will actually be a vtk-file."
-                f"{e}"
-            )
-        return True
-
-    def set_tag_delim(self,delimiters: str):
-        self.tag_delim_pattern=r"^([^" + delimiters + r"]+)"
+        #check if we can write a moab-detabase.
+        self.dummy_h5m()
 
     def dummy_h5m(self):
         mbc, mbt = self.init_moab()
@@ -237,6 +524,9 @@ class Assembly:
         os.unlink("dummy.h5m")
         return True
 
+    def set_tag_delim(self,delimiters: str):
+        self.tag_delim_pattern=r"^([^" + delimiters + r"]+)"
+
     def run(
         self,
         backend: str = "stl",
@@ -245,7 +535,24 @@ class Assembly:
         imprint: bool = False,
         **kwargs: dict,
     ):
-        """convenience function that assumes the stp_files field is set, etc and simply runs the mesher with the set options"""
+        """
+        Convenience function to easily run the processing sequence
+
+        This method merges the calls to import_stp_files, imprint, merge, and solids_to_h5m into a single call
+
+        parameters
+        ----------
+        backend : string
+            Mesh creatinon backend to use. Allowed values are 'stl', 'stl2', 'gmsh, and 'db'. The currently 
+            recommended choices ae "stl2" and "db".
+        h5m_filename : string
+            Filename of the created output data-file which will contains the meshed geometry
+        merge: bool
+            Perform a merge step during geometry processing
+        imprint: bool
+            Perform imprinting step during geometry processing
+
+        """
         self.import_stp_files(**kwargs)
         if imprint:
             self.imprint_all()
@@ -266,18 +573,26 @@ class Assembly:
         **kwargs: dict,
     ):
         """
-        Import a list of step-files.
+        Import a list of step-files and extract material tags.
 
-        Args:
-          tags: dictionary containing pairs of reg.exp. patterns and material tags. If not None, entities with
-              names matching the patterns will be assigned to corresponding tag. If no patterns match
-              the default_tag will be applied
-          match_anywhere: match patterns anywhere in the entitiy name
-          default_tag: The material tag that will be applied if no patterns are matched.
-          scale: overall scaling factor applied to all parts
-          translate: Translation vector to apply to all parts in the step-file.
-          rotate: Rotation angles to apply to the parts in the step-file.
-          vol_skip: list of volumes to skip meshing.
+        parameters
+        ----------
+        tags: dictionary
+            Contains pairs of reg.exp. patterns and material tags. If not None, entities with
+            names matching the patterns will be assigned to corresponding tag. If no patterns match
+            the default_tag will be applied
+        match_anywhere: bool
+            Match patterns anywhere in the entitiy name
+        default_tag: string
+            The material tag that will be applied if no patterns are matched.
+        scale: float
+            Overall scaling factor applied to all parts
+        translate: List
+            3D translation vector to apply to all parts in the step-file.
+        rotate: list
+            Rotation angles to apply to the parts in the step-file.
+        vol_skip: list
+            Numbers of volumes to skip meshing for.
         """
         for stp in self.stp_files:
           warn, ct = has_degenerate_toroids(stp,True)
@@ -386,6 +701,32 @@ class Assembly:
             print(
                 f"WARNING: {len(self.entities)-tags_set} volumes were tagged with the default ({default_tag}) material."
             )
+        # Iterate over the ents array and get all unique tags
+        unique_tags = set(e.tag for e in self.entities if e.tag != default_tag)
+        if unique_tags:
+            print(f"INFO: Found unique tags: {unique_tags}")
+        # Iterate over unique tags
+        for tag in unique_tags:
+            print(f"INFO: Processing tag: {tag}")
+            # Get all entities with this tag
+            tagged_entities = [e for e in self.entities if e.tag == tag]
+            print(f"INFO: Found {len(tagged_entities)} entities with tag {tag}")
+            # Get the bounding box for this tag
+            if tagged_entities:
+                # get the solid from the tagged_entities
+
+                solid_bounding_box_array = [
+                    e.solid.BoundingBox() for e in tagged_entities
+                ]
+                all_solids_bounding_box = solid_bounding_box_array[0]
+                for bb in solid_bounding_box_array[1:]:
+                    all_solids_bounding_box = all_solids_bounding_box.add(bb)
+                bbox = all_solids_bounding_box
+                bbox_text = f"xmin={bbox.xmin}, xmax={bbox.xmax}, ymin={bbox.ymin}, ymax={bbox.ymax}, zmin={bbox.zmin}, zmax={bbox.zmax}"
+                print(f"INFO: Bounding box for tag {tag}: {bbox_text}")
+                # Assign this bounding box to the material_bounds_in_assembly attribute
+                for e in tagged_entities:
+                    e.material_bounds_in_assembly = bbox
 
     def load_stp_file(
         self,
@@ -496,10 +837,12 @@ class Assembly:
     def _datadir_name(self,h5m_filename=""):
         h5mf=pl.Path(h5m_filename)
         if self.datadir==".":
-            self.datadir=datetime.now().strftime(f"{h5mf.stem}_%Y%m%d_%H%M%S.%f")
+            datadir = datetime.now().strftime(f"{h5mf.stem}_%Y%m%d_%H%M%S.%f")
+        else:
+            datadir = self.datadir
         if (self.verbose):
-            print(f"INFO: storing temporary data in directory: {self.datadir}")
-        return self.datadir
+            print(f"INFO: storing temporary data in directory: {datadir}")
+        return datadir
 
     def solids_to_h5m(
         self,
@@ -511,6 +854,21 @@ class Assembly:
 
         **kwargs: dict,
     ):
+        """
+        Convert the imported list of solids into surface-meshed bounded objects
+
+        Main processing function that processes the list of already imported entities. It creates a
+        mesher backend object as appropriate and calls that to create a surface mesh.
+
+        parameters
+        ----------
+        h5m_filename: string
+            Name of the output file
+        backend: string
+            Name of the meshing backend to call. Allowed values are in ["gmsh", "stl", "stl2", "db"]
+        heal: bool
+            Use trimesh (if available) to perform a healing step on the surface normals"
+        """
         #if h5m_filename is not in cwd, run where it resides.
         cwd=pl.Path.cwd()
         h5m_path=pl.Path(h5m_filename)
@@ -1071,9 +1429,14 @@ class Assembly:
         return cq.Compound(bldr.Shape())
 
     def heal_stls(self, stls):
+        #simply return early if trimesh is not available
+        try:
+            import trimesh
+        except ImportError:
+            return
+
         if self.verbose > 0:
             print("INFO: checking surfaces and reparing normals")
-
         for e in self.entities:
             stl = e.stl
             mesh = trimesh.load_mesh(stl)
@@ -1099,7 +1462,7 @@ class Assembly:
 
 def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verbose: int = 1):
     """
-    function that (re)performs the assembly of an h5m_file from a set of already triangularized
+    Function that (re)performs the assembly of an h5m_file from a set of already triangularized
     assemblies.
 
     Usage:
@@ -1109,11 +1472,16 @@ def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verb
         b.run( ... )
         merge2h5m([a,b],h5m_file='c.h5m')
 
-    params:
-        assemblies: Iterable of Assemblies
-        h5m_file: Filename of merged file
-        vtk: If True, also write a vtk-file of the structure
-        verbose; If == 0 do not write status messages
+    paramters
+    ---------
+    assemblies: list
+        Iterable of Assemblies.
+    h5m_file: string
+        Filename of merged file.
+    vtk: bool
+        If True, also write a vtk-file of the structure.
+    verbose: int
+        If == 0 do not write status messages to console.
     """
 
     #create a dummy object - this will not actually be used for anything.
@@ -1137,3 +1505,22 @@ def merge2h5m(assemblies =[], h5m_file: str ="dagmc.h5m", vtk: bool = True, verb
         if verbose > 0:
             print(f'INFO: writing geometry to vtk: ' + str(h5m_p.with_suffix(".vtk")) )
         mbcore.write_file(str(h5m_p.with_suffix(".vtk")))
+    
+def hdf5_in_moab(cls):
+    """
+    function to perform a check on whether the written h5m-name file is actually hdf5
+
+    Usage:
+        a=CAD_to_OpenMC.assembly.hdf5_in_moab()
+    """
+    a = Assembly()
+    try:
+        a.dummy_h5m()
+    except RuntimeError as e:
+        print(
+            "Warning: Can't write a hdf-file. Did you compile moab with hdf5 support?"
+            "The resulting meshed file will actually be a vtk-file."
+            f"{e}"
+        )
+    return True
+
