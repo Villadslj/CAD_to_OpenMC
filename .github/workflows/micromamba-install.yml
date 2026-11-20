@@ -1,0 +1,64 @@
+# This action is intended to run weekly on also testing versions of python
+name: Micromamba install tests (inc. OpenMC and MPI)
+
+on:
+  workflow_dispatch:
+  schedule:
+  - cron: '30 3 * * 0'
+
+permissions:
+  contents: read
+env:
+  PYTHONPATH: '/usr/local/lib'
+
+jobs:
+  build:
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: "/usr/local/lib/python${{matrix.pyv}}/site-packages"
+
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pyv: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        omcv: ["0.14.0", "0.15.0", "0.15.2"]
+        mpi: ["nompi", "mpi_mpich", "mpi_openmpi"]
+        exclude:
+          - pyv: 3.13
+          - pyv: 3.9
+          - pyv: 3.10
+            omcv: 0.15.2
+          - pyv: 3.10
+            omcv: 0.13.3
+        include:
+          - pyv: 3.9
+            omcv: 0.14.0
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Set up Python ${{matrix.pyv}}
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{matrix.pyv}}
+    - name: basic dependencies
+      run: |
+        sudo apt-get update
+        echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
+        sudo apt-get -y install libhdf5-103 xserver-xorg-core xserver-xorg-dev libx11-6 libgl1 libxcursor1 libglu1-mesa libxinerama1 libxft2
+    - name: setup a micromamba environment to get at openmc etc.
+      uses: mamba-org/setup-micromamba@v2
+      with:
+        environment-name: cad_to_openmc_Testing
+        create-args: >-
+          python=${{matrix.pyv}}
+          openmc=${{matrix.omcv}}=dagmc_${{matrix.mpi}}*
+          ocp>=7.7.2.1
+          cadquery>=2.4.0
+        init-shell: bash
+    - name: Test OpenMC
+      run: openmc --version
+      shell: micromamba-shell {0}
+    - name: Install CAD_to_OpenMC using micromamba
+      run: micromamba install -y cad-to-openmc
+      shell: micromamba-shell {0}
