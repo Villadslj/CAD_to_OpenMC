@@ -204,4 +204,7 @@ class MesherDBBuilder:
             self._instance._set_entities(entities)
             self._instance._set_meshpars(tolerance,angular_tolerance)
             self._instance._clear_face_hashtable()
+            # the instance is shared by all runs, so nothing may be left from the previous one
+            self._instance.refine = refine
+            self._instance.threads = min(threads, len(entities))
         return self._instance

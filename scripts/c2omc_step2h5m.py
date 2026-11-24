@@ -29,8 +29,8 @@ parser.add_argument(
     "--threads",
     "-n",
     type=int,
-    default=1,
-    help="The mesher will use THREADS simultaneous processes.",
+    default=None,
+    help="The mesher will use THREADS threads. By default the stl2 and db backends use all available cores.",
 )
 parser.add_argument(
     "--verbose",
@@ -43,9 +43,9 @@ parser.add_argument(
 parser.add_argument(
     "--backend",
     "-b",
-    choices=["stl2", "stl", "gmsh"],
+    choices=["stl2", "db", "stl", "gmsh"],
     default="stl2",
-    help="the meshing backend to use. generally stl2 performs the best.",
+    help="the meshing backend to use. generally stl2 and db perform the best.",
 )
 parser.add_argument(
     "--implc", "-i", default=None, help="material tag for the implicit complement."
