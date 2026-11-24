@@ -43,3 +43,23 @@ If instead you prefer to use a [conda-environment](https://docs.conda.io/project
 3. install CAD_to_OpenMC: ```conda install -c conda-forge cad-to-openmc```
 
 You may of course replace conda with [mamba/micromamba](https://mamba.readthedocs.io/en/latest/), should you prefer to do so. In many cases conda and mamba are already configured by default to use the conda-forge channel. If that is the case you may omit "-c conda-forge"
+
+## Checking a geometry
+A h5m-file can be checked without MOAB, DAGMC or OpenMC:
+```bash
+python -m CAD_to_OpenMC.validate geometry.h5m
+```
+This reports every volume that is not bounded by a closed, consistently oriented triangle mesh, in which case the exit code is 1. Surfaces that coincide without being shared between two volumes are reported as warnings. The option `--json report.json` writes the full report to a file.
+
+## For development
+The test-suite needs MOAB with pymoab, and runs neutronics tests when OpenMC with DAGMC support is available. Neither is on PyPI. They can be installed from conda-forge, or built from source into a virtual environment with the script `support/build_dagmc_stack.sh`:
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e . pytest "cmake<4" cython "setuptools<81"
+support/build_dagmc_stack.sh
+pytest tests
+```
+The script builds HDF5, MOAB, DAGMC and OpenMC below the prefix of the virtual environment and writes nothing outside of it. Besides OpenMC this provides the tools `h5mvalidate` (MOAB) and `check_watertight`, `make_watertight` and `overlap_check` (DAGMC).
+
+Conversion speed is measured with `python -m benchmarks.bench matrix`, see `benchmarks/bench.py`.
