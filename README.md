@@ -80,6 +80,13 @@ If instead you prefer to use a [conda-environment](https://docs.conda.io/project
 
 You may of course replace conda with [mamba/micromamba](https://mamba.readthedocs.io/en/latest/), should you prefer to do so. In many cases conda and mamba are already configured by default to use the conda-forge channel. If that is the case you may omit "-c conda-forge".
 
+## To install as an environment module (e.g. on a Slurm cluster)
+`conda install cad-to-openmc` installs the upstream package. To install the code in this repository instead, run on a login node with conda available:
+```bash
+support/install_cluster_module.sh --prefix <software-dir> --modulefiles <modulefiles-dir> [--with-openmc] [--shared]
+```
+This creates a conda environment with the dependencies from conda-forge, installs CAD_to_OpenMC from this checkout, runs a test conversion and writes a modulefile. Afterwards, also in job scripts: `module use <modulefiles-dir>; module load cad_to_openmc`. See `--help` for all options.
+
 ## Verifying your installation
 Should you wish to do so - you may verify your installation of CAD_to_OpenMC by running the script `self_contained_test.py`-script located in the tests directory. This writes a step-file, converts it to triangles, and checks that the created triangles have vertices as expected. N.b. the last check requires that the library ```h5py``` is installed. If not, the vertex-check is skipped (The entire round trip from ```.step``` to ```.h5m``` is done however).
 
