@@ -1,5 +1,6 @@
 """Import of step-files into an Assembly: the solids, the names of their parts and the material tags."""
 import pathlib
+import re
 
 import cadquery as cq
 import pytest
@@ -54,22 +55,57 @@ def test_skipping_a_volume_keeps_the_tags_of_the_others():
     assert [e.tag for e in imported(PINCELL, vol_skip=[2]).entities] == [tags[0], tags[2]]
 
 
-@pytest.mark.parametrize("unit, declaration", [("M", "SI_UNIT($,.METRE.)"), ("INCH", "CONVERSION_BASED_UNIT('INCH'")])
-def test_file_in_other_length_units_comes_in_as_cm(unit, declaration, tmp_path):
+@pytest.mark.parametrize(
+    "unit, declaration, cm_per_unit",
+    [("M", "SI_UNIT($,.METRE.)", 100.0), ("INCH", "CONVERSION_BASED_UNIT('INCH'", 2.54)],
+)
+def test_file_in_other_length_units_comes_in_as_cm(unit, declaration, cm_per_unit, tmp_path):
     path = tmp_path / "box.step"
-    Interface_Static.SetCVal_s("write.step.unit", unit)
+    # the parameter only exists once a writer has been created
+    writer = STEPControl_Writer()
+    assert Interface_Static.SetCVal_s("write.step.unit", unit)
     try:
-        writer = STEPControl_Writer()
         writer.Transfer(cq.Workplane("XY").box(10, 20, 30, centered=False).val().wrapped, STEPControl_AsIs)
         writer.Write(str(path))
     finally:
         Interface_Static.SetCVal_s("write.step.unit", "MM")
-    # the box of 10 x 20 x 30 mm is in the file in the other unit
-    assert declaration in path.read_text()
+    text = path.read_text()
+    assert declaration in text
+
+    # OCC 7.7 converts the coordinates to the unit, 7.8 writes them unchanged: take the size from the file.
+    points = [
+        [float(v) for v in p.split(",")]
+        for p in re.findall(r"CARTESIAN_POINT\('[^']*',\(([^()]*)\)\)", text)
+    ]
+    size = [max(p[i] for p in points if len(p) == 3) * cm_per_unit for i in range(3)]
 
     (entity,) = imported(path).entities
-    assert (entity.bb.xlen, entity.bb.ylen, entity.bb.zlen) == pytest.approx((1.0, 2.0, 3.0), abs=1e-6)
-    assert entity.volume == pytest.approx(6.0)
+    assert (entity.bb.xlen, entity.bb.ylen, entity.bb.zlen) == pytest.approx(size, rel=1e-6)
+    assert entity.volume == pytest.approx(size[0] * size[1] * size[2], rel=1e-6)
+
+
+def test_session_length_unit_does_not_scale_the_import(tmp_path):
+    path = tmp_path / "box.step"
+    cq.exporters.export(cq.Workplane("XY").box(10, 20, 30), str(path))
+    STEPControl_Writer()
+    assert Interface_Static.SetCVal_s("xstep.cascade.unit", "CM")
+    try:
+        (entity,) = imported(path).entities
+    finally:
+        Interface_Static.SetCVal_s("xstep.cascade.unit", "MM")
+    assert (entity.bb.xlen, entity.bb.ylen, entity.bb.zlen) == pytest.approx((1.0, 2.0, 3.0))
+
+
+def test_gmsh_backend_leaves_the_session_length_unit(tmp_path, monkeypatch):
+    if ab.nogmsh:
+        pytest.skip("gmsh is not usable")
+    # gmsh used to leave it at cm, which made every later import 10 times too small
+    monkeypatch.chdir(tmp_path)
+    cq.exporters.export(cq.Workplane("XY").box(10, 20, 30), "box.step")
+    STEPControl_Writer()
+    before = Interface_Static.CVal_s("xstep.cascade.unit")
+    ab.Assembly(["box.step"], verbose=0).run(backend="gmsh", h5m_filename="box.h5m")
+    assert Interface_Static.CVal_s("xstep.cascade.unit") == before
 
 
 def test_properties_of_an_entity_follow_its_solid():

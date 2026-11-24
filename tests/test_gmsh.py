@@ -17,3 +17,15 @@ class HarnessGmsh(HarnessRun):
 def testgmsh():
   t = HarnessGmsh()
   t.run()
+
+def test_second_gmsh_run_meshes_its_own_solids(tmp_path, monkeypatch):
+  import cadquery as cq
+  monkeypatch.chdir(tmp_path)
+  cq.exporters.export(cq.Workplane("XY").box(10, 20, 30), "one.step")
+  two = cq.Workplane("XY").box(10, 20, 30).union(cq.Workplane("XY").box(5, 5, 5).translate((20, 0, 0)))
+  cq.exporters.export(two, "two.step")
+  for name, n in (("two", 2), ("one", 1)):
+    a = ab.Assembly([f"{name}.step"], verbose=0)
+    a.run(backend="gmsh", h5m_filename=f"{name}.h5m")
+    assert len(a.entities) == n
+    assert all(hasattr(e, "stl") for e in a.entities)

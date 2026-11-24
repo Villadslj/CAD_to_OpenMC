@@ -7,6 +7,7 @@ import cadquery as cq
 import os
 import tempfile
 import math
+from .step_reader import keep_occ_length_unit
 from .assemblymesher_base import assemblymesher
 
 class MesherGMSH(assemblymesher):
@@ -28,9 +29,9 @@ class MesherGMSH(assemblymesher):
     self._gmsh_init()
     self._cq_solids_to_gmsh()
 
-  @classmethod
-  def _set_entities(cls,entities):
-    cls.gmsh_mesher_entities=entities
+  def _set_entities(self,entities):
+    # _reorder sets the list on the instance, so a reused mesher must replace it there
+    self.gmsh_mesher_entities=entities
 
   @property
   def refine(self):
@@ -46,13 +47,13 @@ class MesherGMSH(assemblymesher):
       #assume ref is integer
       self._refine=abs(int(ref))
 
-  def __del__(self):
-    if gmsh.isInitialized():
-        gmsh.finalize()
-
   def _gmsh_init(self):
-      if not gmsh.isInitialized():
+      # a session that is left over holds the volumes of an earlier run, which would be meshed again
+      self._owns_session = not gmsh.isInitialized()
+      if self._owns_session:
         gmsh.initialize()
+      else:
+        gmsh.clear()
 
       if (self.verbosity_level>1):
           gmsh.option.setNumber("General.Terminal",1)
@@ -87,6 +88,7 @@ class MesherGMSH(assemblymesher):
     self.radial_threshold=radial_threshold
     self.refine=refine
     self._gmsh_init()
+    self._cq_solids_to_gmsh()
 
   def _set_radial_field(self):
     #function to set up a radial field for meshing making the
@@ -101,7 +103,8 @@ class MesherGMSH(assemblymesher):
       with tempfile.TemporaryDirectory() as td:
         outpath=os.path.join(td,'export.'+self.IntermediateLayer)
         compound.exportBrep(outpath)
-        vols=gmsh.model.occ.importShapes(outpath)
+        with keep_occ_length_unit():
+          vols=gmsh.model.occ.importShapes(outpath)
       #vols = gmsh.model.occ.importShapesNativePointer(compound)
       gmsh.model.occ.synchronize()
       self._reorder()
@@ -145,6 +148,14 @@ class MesherGMSH(assemblymesher):
       to merge into a h5m-file. Expects that the geometry has been surface-mesh by gmsh
       so we have a list of volumes to operate on.
       We do this be greating gmsh physical groups and export 1 group at a time."""
+      try:
+        return self._write_stls()
+      finally:
+        # gmsh keeps its options (OCCTargetUnit=CM) for as long as the session lasts
+        if self._owns_session and gmsh.isInitialized():
+          gmsh.finalize()
+
+  def _write_stls(self):
       self._generate_mesh()
       stls=[]
       vols=gmsh.model.getEntities(3)

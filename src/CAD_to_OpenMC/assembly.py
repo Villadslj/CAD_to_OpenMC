@@ -35,7 +35,7 @@ from CAD_to_OpenMC.meshed_model import MeshedModel
 from CAD_to_OpenMC.merge import connect_solids, find_overlaps as _find_overlaps
 from CAD_to_OpenMC.occ_mesher import mesh_and_check
 from CAD_to_OpenMC.options import BACKEND_DEFAULTS, MeshOptions
-from CAD_to_OpenMC.step_reader import StepFile
+from CAD_to_OpenMC.step_reader import StepFile, keep_occ_length_unit
 from CAD_to_OpenMC.validate import MeshValidationError, check_model
 from CAD_to_OpenMC.vtk_io import write_vtk
 
@@ -860,7 +860,8 @@ class Assembly:
             raise ImportError("names_from = 'gmsh' needs the gmsh python module, which could not be imported")
         gmsh.initialize()
         try:
-            vols = gmsh.model.occ.importShapes(str(filename))
+            with keep_occ_length_unit():
+                vols = gmsh.model.occ.importShapes(str(filename))
             gmsh.model.occ.synchronize()
             return [gmsh.model.getEntityName(3, v[1]).split("/")[-1] for v in vols]
         finally:

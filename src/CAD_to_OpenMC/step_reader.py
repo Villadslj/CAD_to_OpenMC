@@ -6,9 +6,11 @@ step-file, which is where the material tags come from.
 """
 from __future__ import annotations
 
+import contextlib
 from typing import List
 
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.Interface import Interface_Static
 from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDataStd import TDataStd_Name
@@ -19,7 +21,26 @@ from OCP.TopExp import TopExp
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS_Shape
 from OCP.TopTools import TopTools_IndexedMapOfShape
+from OCP.UnitsMethods import UnitsMethods, UnitsMethods_LengthUnit_Millimeter
 from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
+
+
+@contextlib.contextmanager
+def keep_occ_length_unit():
+    """Restore the length unit of the OpenCASCADE session on exit.
+
+    gmsh shares OpenCASCADE with cadquery when both come from conda-forge. Its step and brep imports
+    leave the unit at Geometry.OCCTargetUnit, both the setting read by the step-reader and the
+    factor used by the step-writer, which scaled every later import and export.
+    """
+    setting = Interface_Static.CVal_s("xstep.cascade.unit")
+    factor = UnitsMethods.GetCasCadeLengthUnit_s()
+    try:
+        yield
+    finally:
+        if setting:
+            Interface_Static.SetCVal_s("xstep.cascade.unit", setting)
+        UnitsMethods.SetCasCadeLengthUnit_s(factor)
 
 
 def _name(label: TDF_Label) -> str:
@@ -48,6 +69,9 @@ class StepFile:
         self.filename = str(filename)
         # the document has to stay alive for as long as its labels are used
         self._document = TDocStd_Document(TCollection_ExtendedString("XmlOcaf"))
+        # Shapes come in mm, whatever the session unit (xstep.cascade.unit) is: gmsh, for one, sets it
+        # to its Geometry.OCCTargetUnit when it shares OpenCASCADE with cadquery.
+        XCAFDoc_DocumentTool.SetLengthUnit_s(self._document, 1.0, UnitsMethods_LengthUnit_Millimeter)
         reader = STEPCAFControl_Reader()
         reader.SetNameMode(True)
         for switch_off in (reader.SetColorMode, reader.SetLayerMode, reader.SetSHUOMode, reader.SetGDTMode):

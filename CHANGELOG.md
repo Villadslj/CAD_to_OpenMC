@@ -1,4 +1,12 @@
 # unreleased changes since 1.0.1
+- the 'gmsh' backend no longer changes the length unit of the OCC session. With
+gmsh from conda-forge, which shares OCC with cadquery, every later import or
+export was 10 times off. Step-files are now always read in mm.
+- a second 'gmsh' run in the same python session meshed the solids of the first
+run again (or none at all). The mesher now loads the new solids, and closes the
+gmsh session it opened when it is done.
+- test_file_in_other_length_units_comes_in_as_cm works with OCC 7.8, which does
+not convert the coordinates when it writes a step-file in other units.
 - the 'stl2' and 'db' backends now triangulate all solids together and keep the
 mesh in memory, instead of writing one stl-file per face. Every edge is divided
 once, so the surfaces of a volume always fit together, whatever the order of the
