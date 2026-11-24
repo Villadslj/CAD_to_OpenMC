@@ -32,8 +32,10 @@ from CAD_to_OpenMC.datadirectory import mesher_datadir
 from CAD_to_OpenMC.check_step import has_degenerate_toroids
 from CAD_to_OpenMC.h5m_io import write_h5m
 from CAD_to_OpenMC.meshed_model import MeshedModel
+from CAD_to_OpenMC.merge import connect_solids, find_overlaps as _find_overlaps
 from CAD_to_OpenMC.occ_mesher import mesh_and_check
 from CAD_to_OpenMC.options import BACKEND_DEFAULTS, MeshOptions
+from CAD_to_OpenMC.step_reader import StepFile
 from CAD_to_OpenMC.validate import MeshValidationError, check_model
 from CAD_to_OpenMC.vtk_io import write_vtk
 
@@ -112,19 +114,63 @@ class Entity:
         The index number of the part/solid.
     tag : string
         Material tag of the part/solid
+    name : string
+        Name of the part in the step-file
+
+    The bounding box (bb), the center and the volume of the solid are computed when they are first
+    asked for.
     """
 
-    def __init__(self, solid=None, idx=0, tag="vacuum"):
+    def __init__(self, solid=None, idx=0, tag="vacuum", name=""):
+        self._solid = None
+        self._properties = {}
         if solid is not None:
             self.solid = solid
             self.idx = idx
             self.tag = tag
-            # extract some parameters from the solid for later.
-            self.bb = solid.BoundingBox()
-            self.center = solid.Center()
-            self.volume = solid.Volume()
+            self.name = name
             # When availalble, the bounding box in the entire assembly for every part made of this material is stored
             self.material_bounds_in_assembly: BoundBox | None = None
+
+    @property
+    def solid(self):
+        return self._solid
+
+    @solid.setter
+    def solid(self, solid):
+        if solid is not self._solid:
+            # what was computed belongs to the previous solid
+            self._properties = {}
+        self._solid = solid
+
+    def _property(self, name, compute):
+        if name not in self._properties:
+            self._properties[name] = compute()
+        return self._properties[name]
+
+    @property
+    def bb(self):
+        return self._property("bb", self.solid.BoundingBox)
+
+    @bb.setter
+    def bb(self, value):
+        self._properties["bb"] = value
+
+    @property
+    def center(self):
+        return self._property("center", self.solid.Center)
+
+    @center.setter
+    def center(self, value):
+        self._properties["center"] = value
+
+    @property
+    def volume(self):
+        return self._property("volume", self.solid.Volume)
+
+    @volume.setter
+    def volume(self, value):
+        self._properties["volume"] = value
 
     def get_cms_relative_distance(
         self,
@@ -554,9 +600,14 @@ class Assembly:
         self.implicit_complement = implicit_complement
         self.noextract_tags = True
         self.tag_delim_pattern=r"^([^\s_@]+)"
+        # where the names of the parts come from: "step" reads them from the step-file itself,
+        # "gmsh" asks gmsh for them, which is slow for files with many parts.
+        self.names_from = "step"
         # the surface mesh and the outcome of its checks, set by the stl2 and db backends
         self.meshed_model = None
         self.validation_report = None
+        # the regions that more than one solid laid claim to, set by merge_all
+        self.overlaps = []
 
     def dummy_h5m(self):
         """Check that MOAB can write a hdf-file; this is what the backends that go through pymoab rely on."""
@@ -645,59 +696,37 @@ class Assembly:
         tags_set = 0
         # clear list to avoid double-import
         self.entities = []
+        self.meshed_model = self.validation_report = None
 
-        message = "Need gmsh python module installed to extract material tags from step-file. please supply a 'sequential_tags'-list instead"
-        assert (nogmsh and tags is None and sequential_tags is not None) or (
-            not nogmsh
-        ), message
-        # if no gmsh module was imported we must rely on explicit sequential tags, so check they're there.
         i = 1
         for stp in self.stp_files:
-            solid = self.load_stp_file(stp, scale, translate, rotate)
+            solid, names = self._load_stp_file(stp, scale, translate, rotate)
 
+            # the solids that are kept, each with the name of its part and its number in the file
             ents = []
-            # try if solid is iterable
-            try:
-                for j in range(len(solid)):
-                    if j + i not in vol_skip:
-                        s = solid[j]
-                        e = Entity(solid=s)
-                        ents.append(e)
-                i = i + len(solid)
-            except Exception as _e:
-                e = Entity(solid=solid)
-                ents.append(e)
+            for j, (s, name) in enumerate(zip(solid, names)):
+                if j + i not in vol_skip:
+                    ents.append(Entity(solid=s, idx=j + 1, name=name))
+            i = i + len(solid)
 
             if tags is None and sequential_tags is None:
-                # also import using gmsh to extract the material tags from the labels in the step files
-                gmsh.initialize()
-                vols = gmsh.model.occ.importShapes(stp)
-                gmsh.model.occ.synchronize()
-                for e, v in zip(ents, vols):
-                    vid = v[1]
+                # extract the material tags from the names of the parts in the step files
+                for e in ents:
                     try:
-                        s = gmsh.model.getEntityName(3, vid)
-                        part = s.split("/")[-1]
-                        g = re.match(self.tag_delim_pattern, part)
+                        g = re.match(self.tag_delim_pattern, e.name)
                         tag = unidecode(g[0])
                         if self.verbose > 1:
                             print(
-                                f"INFO: Tagging volume #{vid} label:{s} with material {tag}"
+                                f"INFO: Tagging volume #{e.idx} label:{e.name} with material {tag}"
                             )
                     except Exception as _e:
                         tag = default_tag
                     e.tag = tag
                     tags_set = tags_set + 1
-                gmsh.finalize()
             elif tags:
                 # tag objects according to the tags dictionary.
-                gmsh.initialize()
-                vols = gmsh.model.occ.importShapes(stp)
-                gmsh.model.occ.synchronize()
-                for e, v in zip(ents, vols):
-                    vid = v[1]
-                    s = gmsh.model.getEntityName(3, vid)
-                    part = s.split("/")[-1]
+                for e in ents:
+                    part = e.name
                     tag = None
                     for k in tags.keys():
                         if match_anywhere:
@@ -725,9 +754,8 @@ class Assembly:
                     e.tag = tag
                     if self.verbose > 1:
                         print(
-                            f"INFO: Tagging volume #{vid} label:{s} with material {tag}"
+                            f"INFO: Tagging volume #{e.idx} label:{part} with material {tag}"
                         )
-                gmsh.finalize()
             elif sequential_tags:
                 for e, t in zip_longest(
                     ents, sequential_tags[tags_set:], fillvalue=self.default_tag
@@ -794,8 +822,19 @@ class Assembly:
         Returns:
             [CadQuery.solid]
         """
+        return self._load_stp_file(filename, scale_factor, translate, rotate)[0]
+
+    def _load_stp_file(self, filename, scale_factor, translate, rotate):
+        """The solids of a step-file, and for every solid the name of the part it belongs to."""
         # import _all_ the shapes in the file - i.e. may return a list
-        part = cq.importers.importStep(str(filename)).vals()
+        step = StepFile(filename)
+        part = [cq.Shape.cast(shape) for shape in step.shapes]
+        if self.names_from == "gmsh":
+            names = self._names_from_gmsh(filename)
+        elif self.names_from == "step":
+            names = step.solid_names()
+        else:
+            raise ValueError(f"names_from must be 'step' or 'gmsh', got {self.names_from!r}")
 
         # apply apply_transforms
         scaled_part = self.apply_transforms(
@@ -811,7 +850,21 @@ class Assembly:
         except Exception as _e:
             solid.extend(scaled_part.Solids())
 
-        return solid
+        # solids without a name get the default tag
+        names = list(names) + [""] * (len(solid) - len(names))
+        return solid, names
+
+    def _names_from_gmsh(self, filename):
+        """The names of the parts as gmsh reports them: the way the tags were found up to version 1."""
+        if nogmsh:
+            raise ImportError("names_from = 'gmsh' needs the gmsh python module, which could not be imported")
+        gmsh.initialize()
+        try:
+            vols = gmsh.model.occ.importShapes(str(filename))
+            gmsh.model.occ.synchronize()
+            return [gmsh.model.getEntityName(3, v[1]).split("/")[-1] for v in vols]
+        finally:
+            gmsh.finalize()
 
     def apply_transforms(self, part, filename, scale_factor, translate, rotate):
         # scale the shapes even if the factor is 1.
@@ -990,7 +1043,7 @@ class Assembly:
             options,
             names=[getattr(e, "name", None) or "" for e in self.entities],
             implicit_complement=self.implicit_complement,
-            cad_volumes=[e.solid.Volume() for e in self.entities],
+            cad_volumes=[e.volume for e in self.entities],
             volume_rtol=mesher_config.get("volume_tolerance"),
         )
         meshed = time.perf_counter()
@@ -1338,71 +1391,79 @@ class Assembly:
         tags["global_id"] = moab_core.tag_get_handle(types.GLOBAL_ID_TAG_NAME)
         return moab_core, tags
 
+    def _solid_label(self, i):
+        """Number and part name of the i'th entity, for messages."""
+        name = getattr(self.entities[i], "name", "")
+        return f"{i + 1}" + (f" ('{name}')" if name else "")
+
+    def _print_overlaps(self, overlaps, prefix, resolved, limit=20):
+        largest = sorted(overlaps, key=lambda overlap: -overlap.volume)
+        for overlap in largest[:limit]:
+            labels = [self._solid_label(i) for i in overlap.solids]
+            print(
+                f"{prefix}: solids {', '.join(labels[:-1])} and {labels[-1]} overlap "
+                f"in a region of volume {overlap.volume:.6g}."
+                + (f" The region is given to solid {overlap.owner + 1}." if resolved else "")
+            )
+        if len(largest) > limit:
+            print(
+                f"{prefix}: ... and {len(largest) - limit} smaller overlaps, "
+                f"{sum(o.volume for o in largest):.6g} in volume all together."
+            )
+
+    def find_overlaps(self):
+        """Look for solids that overlap.
+
+        merge_all notices an overlap only if faces of the solids involved coincide. This method
+        computes all intersections between the solids, which takes about twice as long as
+        merge_all. It changes nothing.
+
+        returns
+        -------
+        list of CAD_to_OpenMC.merge.Overlap
+            The largest first. Each has the positions of the solids in the list of entities, and
+            the volume of the region they have in common. Contacts that are not exact in the CAD
+            model show up as overlaps of a very small volume.
+        """
+        overlaps = _find_overlaps([e.solid for e in self.entities])
+        if self.verbose:
+            self._print_overlaps(overlaps, "INFO", resolved=False)
+            print(f"INFO: found {len(overlaps)} overlaps between {len(self.entities)} solids.")
+        return overlaps
+
     def merge_all(self):
+        """Make the solids that touch share their common faces.
+
+        Every entity keeps its place in the list and gets the solid that has taken the place of
+        its own. Solids that overlap are told apart where the merge brings the overlap to light,
+        see find_overlaps: the region they have in common is given to the smallest of them, and
+        such overlaps are reported and kept in the attribute overlaps. A solid that is cut into
+        parts that do not touch by solids that overlap it becomes one entity for every part.
+        """
         # merging a single object does not really make sense
         if len(self.entities) > 0:
-            # extract cq solids backend algorithm
-            unmerged = [e.solid for e in self.entities]
+            connected = connect_solids([e.solid for e in self.entities])
+            self.overlaps = connected.overlaps
+            for line in connected.warnings[:20]:
+                print(f"WARNING: OpenCASCADE reports for the merge: {line}")
+            self._print_overlaps(connected.overlaps, "WARNING", resolved=True)
 
-            # Pre-calculate and cache the volume, bounding box, and center of each
-            unmerged_vols = [x.Volume() for x in unmerged]
-            unmerged_bbs = [x.BoundingBox() for x in unmerged]
-            unmerged_centers = [x.Center() for x in unmerged]
-
-            # do merge
-            # merged = self._merge_solids(unmerged, fuzzy_value=1e-6)
-            merged = self._merge_solids_full(unmerged, fuzzy_value=1e-6)
-            # the merging process may result in extra volumes.
-            # We need to make sure these are at the end of the list
-            # If not this results in a loss of volumes in the end.
-            print("INFO: reordering volumes after merge")
-            tmp_ents = []
-
-            # Figure of which of the merged solids best corresponds to
-            # each of the unmerged volumes.
-            merged_solids = merged.Solids()
-
-            # Pre-calculate and cache the volume, bounding box, and center of each
-            merged_vols = [x.Volume() for x in merged_solids]
-            merged_bbs = [x.BoundingBox() for x in merged_solids]
-            merged_centers = [x.Center() for x in merged_solids]
-
-            for j, orig in enumerate(unmerged):
-                d_small = 1e9
-                i_small = -1
-                if self.verbose > 1:
+            merged = []
+            for i, (ent, pieces) in enumerate(zip(self.entities, connected.pieces)):
+                if not pieces:
                     print(
-                        f"INFO: {len(merged_solids)} merged solids left in list of originally {len(merged.Solids())}"
+                        f"WARNING: solid {self._solid_label(i)} has no region of its own and is left out. "
+                        "Please examine the CAD model."
                     )
-                for i, ms in enumerate(merged_solids):
-                    d = similar_solids(
-                        unmerged_vols[j],
-                        unmerged_bbs[j],
-                        unmerged_centers[j],
-                        merged_vols[i],
-                        merged_bbs[i],
-                        merged_centers[i],
-                    )
-                    if d < d_small:
-                        i_small, d_small = i, d
-                if i_small == -1:
-                    print(
-                        f"WARNING: Could not find a matching merged volume for volume {j+1}.",
-                        end=" ",
-                    )
-                    print(
-                        "This volume/entity will be skipped. Please examine the output volume carefully."
-                    )
-                else:
-                    # Transfer the picked solid to the list of merged solids, removing (pop) it from the list
-                    # This to avoid going through the whole list more than once.
-                    ent = self.entities[j]
-                    ent.solid = merged_solids.pop(i_small)
-                    merged_vols.pop(i_small)
-                    merged_bbs.pop(i_small)
-                    merged_centers.pop(i_small)
-                    tmp_ents.append(ent)
-            self.entities = tmp_ents
+                for n, piece in enumerate(pieces):
+                    if n > 0:
+                        # cut into parts that do not touch: every part is a volume of the same material
+                        bounds = ent.material_bounds_in_assembly
+                        ent = Entity(solid=ent.solid, idx=ent.idx, tag=ent.tag, name=getattr(ent, "name", ""))
+                        ent.material_bounds_in_assembly = bounds
+                    ent.solid = cq.Shape.cast(piece)
+                    merged.append(ent)
+            self.entities = merged
 
     def imprint_all(self):
         if len(self.entities) > 0:

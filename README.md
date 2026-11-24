@@ -42,7 +42,7 @@ networkx
 unidecode
 Cython
 ```
-Note, it is possible to run CAD_to_OpenMC without gmsh installed. In this case the material-tag extraction feature is disabled, and you will have to supply a list of tags to be applied sequentially.
+Note, it is possible to run CAD_to_OpenMC without gmsh installed: it is only needed for the gmsh meshing backend. The material tags are read from the step-file itself.
 Also note, if you follow the conda-route below, caquery-ocp is called ocp.
 
 ## To install/set up in a virtual python environment
@@ -231,12 +231,26 @@ print(a.validation_report.summary())
 ```
 Any h5m-file, also one written by other tools, can be checked from the command line with ```python -m CAD_to_OpenMC.validate geometry.h5m```.
 
+## Parts that overlap
+The parts of a CAD model should touch, not overlap. The merge step makes parts that touch share their common surface. It notices an overlap only if surfaces of the two parts coincide, as for a part that is embedded in another one. The region the parts have in common is then given to the smaller part, and a warning is printed. A part that sticks into another one otherwise goes unnoticed, and the two volumes overlap in the h5m-file. Whether the parts of a model overlap can be checked, which takes about twice as long as the merge itself:
+```python
+a.import_stp_files()
+for overlap in a.find_overlaps():
+    print(overlap.solids, overlap.volume)
+```
+Every overlap has the positions of the parts in ```a.entities``` and the volume of the region they have in common. Contacts that are not exact in the CAD model show up as overlaps with a very small volume. Nothing is changed by the check.
+
 ## tag delimiter
 As of 0.3.6 it is possible to manipulate the delimiter used when extracting material tags from part names. By default the regexp used is "\s_@" meaning to split on whitespace, underscores and @. E.g. this will make parts "dr_bunsen" and "dr_beaker" be tagged with "dr". If however the method "set_tag_delim" is called on an assembly object with an argument "\s@" this results in the parts being tagged "dr_bunsen" and "dr_beaker".
 ```python
 import CAD_to_OpenMC.assembly as ab
 a=ab.Assembly()
 a.set_tag_delim("\s@")
+```
+
+The names of the parts are read from the step-file together with the shapes. All solids of a part get the name of that part. Up to version 1.0 the names were found by importing the file a second time with gmsh, which took most of the import time for files with many parts, and did not find a name for the solids of a part that consists of several bodies. That way of finding the names is still available:
+```python
+a.names_from='gmsh'
 ```
 
 ## implicit complement

@@ -19,6 +19,25 @@ relative_tolerance_factor, strict, volume_tolerance, vtk.
 - the previous implementations remain available as the backends 'stl2-legacy'
 and 'db-legacy'.
 - new: python -m CAD_to_OpenMC.validate file.h5m checks any DAGMC h5m-file.
+- the names of the parts, which the material tags are taken from, are read from
+the step-file together with the shapes. The second import of the file with gmsh
+is gone, which took most of the import time for files with many parts. gmsh is
+only needed for the 'gmsh' backend. Assembly.names_from = 'gmsh' brings the
+previous way of finding the names back.
+- all solids of a part that consists of several bodies get the tag of the part.
+They used to get the default tag.
+- vol_skip no longer shifts the tags: the volumes that are kept keep their own.
+- merge_all takes the solid that replaces every part from the record
+OpenCASCADE keeps of the merge, instead of comparing volumes, bounding boxes and
+centres of all solids with each other. That comparison took most of the time of
+the merge for models with many parts.
+- where the merge finds that solids overlap, the region they have in common is
+given to the smallest of them and a warning is printed. Nothing is left out;
+before, the pieces that were left over were dropped. The overlaps are kept in
+Assembly.overlaps.
+- new: Assembly.find_overlaps() looks for all solids that overlap, also those
+the merge does not notice, and gives the volume of the regions.
+- merge_all raises MergeError when OpenCASCADE reports that it failed.
 - merge2h5m joins the meshes of assemblies meshed with 'stl2' or 'db' in memory.
 It failed before, as the stl-files of the assemblies were not found.
 - fixes: settings of an earlier run (refine, threads) no longer leak into the
